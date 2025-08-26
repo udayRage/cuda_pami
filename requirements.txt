@@ -1,0 +1,10 @@
+cudf
+cupy
+pandas
+numpy
+matplotlib
+plotly
+sphinx
+furo
+black
+flake8
