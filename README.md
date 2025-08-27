@@ -132,3 +132,19 @@ Use the generated Jupyter Notebook (`notebooks/fuzzy/MyFuzzyMiner.ipynb`) to:
 3.  Run the `mine()` method to execute the algorithm.
 4.  Analyze and visualize the results stored in `self.patterns`.
 5.  Save the results using the `save()` method.
+
+## Documentation
+
+This project uses [Sphinx](https://www.sphinx-doc.org/) to generate documentation from the source code docstrings.
+
+### Building the Documentation
+
+After making changes to the code, especially to the docstrings, you need to rebuild the documentation to reflect the changes.
+
+To build the HTML documentation, run the following command from the root of the project:
+
+```bash
+make -C docs html
+```
+
+The generated documentation will be available in the `docs/build/html` directory. You can view it by opening `docs/build/html/index.html` in your web browser.

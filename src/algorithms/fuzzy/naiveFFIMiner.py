@@ -34,18 +34,19 @@ import re
 # Import everything from the base module.
 from ..base import *
 
+os.environ["POLARS_MAX_THREADS"] = str(os.cpu_count())  # set BEFORE importing polars
+
+
 # Check for GPU and CPU library availability
 try:
     import cupy as cp
     import cudf
-    import pandas as pd
     import polars as pl
     GPU_AVAILABLE = cp.cuda.is_available()
 except ImportError:
     print("Warning: Missing one or more required libraries (cupy, cudf, polars).")
     GPU_AVAILABLE = False
 
-os.environ.setdefault("POLARS_MAX_THREADS", str(os.cpu_count()))
 # --- CUDA & Host Data Structures (unchanged) ---
 THREADS = 1024
 INV_LOAD_FACTOR = 3/2
@@ -148,112 +149,120 @@ else:
 
 
 class naiveFFIMiner(BaseAlgorithm):
-    """
-    Advanced implementation of cuFFIMiner with automatic scaling and high-performance
+    """Advanced implementation of cuFFIMiner with automatic scaling and high-performance
     CPU-based pre-processing using the Polars library.
 
-    :ivar patterns: A dictionary storing the discovered frequent patterns.
+    This class discovers fuzzy frequent itemsets from transactional data. It is optimized
+    for performance by using a combination of CPU and GPU processing. The CPU is used for
+    efficiently loading and pre-processing the data with Polars, while the GPU accelerates
+    the core mining process using CUDA kernels.
+
+    A key feature is its ability to automatically determine the correct scaling factor
+    for floating-point fuzzy values, which simplifies configuration and ensures
+    precision is maintained during the mining process.
+
+    :ivar patterns: A dictionary storing the discovered frequent patterns. The keys are
+                    tuples of item names, and the values are their corresponding support
+                    as floating-point numbers.
+    :vartype patterns: Dict[Tuple[str, ...], float]
     """
 
-    def __init__(self, iFile: Union[str, Path], min_support: float, sep: str = "\t", debug: bool = False):
-        """
-        Initializes the advanced cuFFIMiner algorithm.
+    def __init__(self, iFile: Union[str, Path], min_support: float, sep: str = "\t", quant_mult: int = None, debug: bool = False):
+        """Initializes the advanced cuFFIMiner algorithm.
 
-        :param iFile: Input file path (text or Parquet).
+        :param iFile: Path to the input file. Can be a text file (CSV, TSV) or a Parquet file.
         :type iFile: Union[str, Path]
-        :param min_support: The minimum support threshold as a float (e.g., 0.05).
+        :param min_support: The minimum support threshold as a float (e.g., 0.05 for 5%).
         :type min_support: float
-        :param sep: The separator used in text input files.
-        :type sep: str
-        :param debug: If True, enables detailed memory and CPU profiling.
-        :type debug: bool
+        :param sep: The separator character used in text input files. Defaults to tab.
+        :type sep: str, optional
+        :param debug: If True, enables detailed memory and CPU profiling messages.
+        :type debug: bool, optional
+        :raises RuntimeError: If required GPU libraries (cuDF, CuPy) or Polars are not available.
         """
         super().__init__(iFile=iFile, debug=debug)
+
+        if debug:
+            pl.Config.set_verbose(True)
+
+
         if not GPU_AVAILABLE:
             raise RuntimeError("cuFFIMiner_Adv requires GPU libraries (cuDF, CuPy) and Polars.")
 
         self.min_support_float = min_support
+        # Optional externally provided quantization multiplier (forced)
+        self.forced_quant_mult = quant_mult if (quant_mult is not None and quant_mult > 0) else None
         self._sep = sep
         self._gpu_memory_usage = 0
         self.patterns: Dict[Tuple[str, ...], float] = {}
 
     def _cpu_load_and_scale_data(self) -> cudf.DataFrame:
         """
-        Loads, transforms, and scales data using Polars on the CPU, then converts to a
-        cuDF DataFrame for GPU handoff.
-
-        :raises ValueError: If data conversion fails.
-        :return: A cuDF DataFrame ready for the GPU mining stages.
-        :rtype: cudf.DataFrame
+        Loads, transforms, and scales data using Polars' LAZY engine for maximum parallelism
+        and performs a high-performance data handoff to the GPU via Apache Arrow.
         """
         is_parquet = str(self._iFile).lower().endswith(".parquet")
-        print(f"Starting high-performance CPU pre-processing with Polars (all cores)...")
 
         if is_parquet:
-            # Read Parquet directly
             df = pl.read_parquet(self._iFile)
-            value_col_name = "prob" # Parquet format has a 'prob' column
+            value_col_name = "prob"
         else:
-            # Read and parse text file
-            df_base = (
-                pl.read_csv(self._iFile, has_header=False, separator="\n", new_columns=["line"])
-                .with_columns(
-                    pl.col("line").str.split_exact(":", n=1).alias("struct_col")
-                )
-                .unnest("struct_col")
-                .rename({"field_0": "items_str", "field_1": "values_str"})
-                .with_columns(
-                    # Split the strings into lists of items and values
-                    pl.col("items_str").str.split(self._sep).alias("items_list"),
-                    pl.col("values_str").str.split(self._sep).alias("values_list")
-                )
+            # --- OPTIMIZED LAZY TEXT FILE PROCESSING ---
+            # 1. Use scan_csv for a lazy read. This doesn't load data, it just creates a plan.
+            #    Read with the primary delimiter FIRST. This is key for parallelization.
+            lazy_df_base = pl.scan_csv(
+                self._iFile,
+                has_header=False,
+                separator=":",
+                new_columns=["items_str", "values_str"]
+            ).with_columns(
+                # 2. Build the parsing steps into the lazy plan
+                pl.col("items_str").str.split(self._sep),
+                pl.col("values_str").str.split(self._sep)
             )
-            
-            # *** THE CRITICAL FIX IS HERE ***
-            # Filter out any rows where the number of items doesn't match the number of values.
-            # This prevents the ShapeError during the explode operation.
-            df_filtered = df_base.filter(
-                pl.col("items_list").list.len() == pl.col("values_list").list.len()
-            )
-            
-            if self.debug:
-                dropped_rows = len(df_base) - len(df_filtered)
-                if dropped_rows > 0:
-                    print(f"Warning: Dropped {dropped_rows} malformed rows from the input file.")
 
-            df = (
-                df_filtered
-                # Now it is safe to explode the lists into individual rows
-                .explode(["items_list", "values_list"])
-                .rename({"items_list": "item", "values_list": "prob"})
+            # 3. Add the filter to the lazy plan. No data is touched yet.
+            lazy_df_filtered = lazy_df_base.filter(
+                pl.col("items_str").list.len() == pl.col("values_str").list.len()
+            )
+
+            # 4. Add the explode and rename operations to the lazy plan.
+            lazy_df_exploded = lazy_df_filtered.explode(["items_str", "values_str"]).rename(
+                {"items_str": "item", "values_str": "prob"}
             )
             
-            df = df.with_row_index("txn_id", offset=1)
+            # 5. TRIGGER EXECUTION: .collect() tells Polars to run the optimized plan now.
+            #    Polars will now read and process the file in parallel chunks.
+            df = lazy_df_exploded.with_row_index("txn_id", offset=1).collect()
             value_col_name = "prob"
 
-        # --- Automatic Scaling Logic ---
-        # Find the maximum number of decimal places in the 'prob' column
-        max_decimals = (
-            df.get_column(value_col_name)
-            .cast(pl.Utf8) # Ensure it's a string to check for decimals
-            .str.split_exact(".", n=2)
-            .struct.field("field_1") # Get the part after the decimal
-            .str.len_chars()
-            .fill_null(0) # Integers will be null, so they have 0 decimal places
-            .max()
-        )
-
-        if max_decimals is None: max_decimals = 0 # Handle empty file case
-        
-        self.scale_factor = 10 ** max_decimals
+        if self.forced_quant_mult is not None:
+            self.scale_factor = int(self.forced_quant_mult)
+            max_decimals = None
+        else:
+            max_decimals = (
+                df.get_column(value_col_name)
+                  .cast(pl.Utf8)
+                  .str.split_exact(".", 1)
+                  .struct.field("field_1")
+                  .str.len_chars()
+                  .fill_null(0)
+                  .max()
+            )
+            if max_decimals is None:
+                max_decimals = 0
+            self.scale_factor = 10 ** max_decimals
         self._minSup_scaled = int(self.min_support_float * self.scale_factor)
 
         if self.debug:
-            print(f"Auto-detected max decimals: {max_decimals}")
-            print(f"Calculated scale factor: {self.scale_factor}")
+            if self.forced_quant_mult is not None:
+                print(f"Using forced quant_mult: {self.scale_factor}")
+            else:
+                print(f"Auto-detected max decimals: {max_decimals}")
+                print(f"Calculated quant_mult (scale_factor): {self.scale_factor}")
             print(f"Scaled minimum support: {self._minSup_scaled}")
 
-        # Apply scaling to create the final integer 'prob' column
+        # Apply scaling and select final columns
         df = df.with_columns(
             (pl.col(value_col_name).cast(pl.Float64) * self.scale_factor).cast(pl.UInt32).alias("prob_scaled")
         ).select(
@@ -262,13 +271,18 @@ class naiveFFIMiner(BaseAlgorithm):
             pl.col("txn_id").cast(pl.UInt32)
         )
 
-        print(f"CPU processing complete. Handing off {len(df)} rows to GPU...")
-        # Efficiently convert from Polars -> Pandas -> cuDF
-        return cudf.from_pandas(df.to_pandas())
+        
+        return cudf.DataFrame.from_arrow(df.to_arrow())
 
     def _mine(self):
-        """
-        Orchestrates the main mining process.
+        """Orchestrates the main mining process.
+
+        This method executes the end-to-end workflow of the algorithm:
+        1.  Calls ``_cpu_load_and_scale_data`` to load and pre-process the data on the CPU.
+        2.  Filters items that do not meet the minimum support threshold.
+        3.  Allocates and builds the necessary hash table structures on the GPU.
+        4.  Performs the iterative mining process on the GPU to find frequent itemsets.
+        5.  Processes the results and cleans up GPU memory.
         """
         # --- 1. High-performance CPU load, parse, and scale ---
         exploded_gdf = self._cpu_load_and_scale_data()
@@ -276,22 +290,20 @@ class naiveFFIMiner(BaseAlgorithm):
         # --- 2. Filter Items and Setup for GPU (Unchanged) ---
         support_df, final_gdf = self._calculate_support_and_filter_items(exploded_gdf)
         if support_df is None:
-            print("No frequent items found after filtering. Exiting.")
             self.patterns = {}
             return
             
         # --- 3. Allocate and Build GPU Data Structures (Unchanged) ---
-        print("Allocating and building GPU hash tables...")
         ht_host = self._allocate_gpu_hash_tables(support_df)
         self._build_gpu_hash_tables(ht_host, final_gdf)
 
         # --- 4. Iterative Mining on GPU (Unchanged) ---
-        print("Mining frequent patterns on GPU...")
         k = 1
         candidates = self.support_df["new_id"].to_cupy().reshape(-1, 1)
         gpu_results = []
         while len(candidates) > 0:
-            if self.debug: print(f"Mining {k+1}-itemsets from {len(candidates)} candidates...")
+            if self.debug: 
+                print(f"Mining {k+1}-itemsets from {len(candidates)} candidates...")
             next_candidates = self._generate_next_candidates(candidates, k)
             if len(next_candidates) == 0: break
             k += 1
@@ -311,8 +323,18 @@ class naiveFFIMiner(BaseAlgorithm):
         cp.get_default_memory_pool().free_all_blocks()
 
     def _process_results(self, gpu_results):
-        """Converts raw GPU results and rescales supports back to floats."""
-        print("Processing, decoding, and rescaling results...")
+        """Processes raw GPU results, decodes item names, and rescales supports.
+
+        This method takes the raw output from the GPU mining phase, which consists of
+        integer item IDs and scaled support counts. It converts the item IDs back to
+        their original string names and rescales the support values back to their
+        original floating-point representation.
+
+        :param gpu_results: A list of tuples, where each tuple contains the frequent
+                            candidate itemsets (as NumPy arrays of IDs) and their
+                            corresponding scaled support counts.
+        :type gpu_results: list
+        """
         # Rescale the support of 1-itemsets
         patterns = {
             (item,): float(prob) / self.scale_factor
@@ -324,15 +346,24 @@ class naiveFFIMiner(BaseAlgorithm):
             for name_tuple, sup in zip(names, vals):
                 patterns[tuple(name_tuple)] = float(sup) / self.scale_factor
         self.patterns = patterns
-        print(f"\nTotal frequent patterns found: {len(self.patterns)}")
 
-    # ========================================================================
-    # All subsequent helper methods (_calculate_support_and_filter_items,
-    # _allocate_gpu_hash_tables, _build_gpu_hash_tables, CUDA helpers, save,
-    # print_results, etc.) are IDENTICAL to the previous version and can be
-    # copied here without modification.
-    # ========================================================================
     def _calculate_support_and_filter_items(self, gdf: cudf.DataFrame) -> Tuple[cudf.DataFrame, cudf.DataFrame]:
+        """Calculates initial item supports, filters infrequent items, and remaps IDs.
+
+        This function performs the first major filtering step. It groups the transaction
+        data by item to calculate the total support for each. Items that do not meet
+        the scaled minimum support threshold are discarded. The remaining frequent items
+        are then assigned new, contiguous integer IDs for more efficient processing on the GPU.
+
+        :param gdf: The input cuDF DataFrame containing columns 'item', 'prob', and 'txn_id'.
+        :type gdf: cudf.DataFrame
+        :return: A tuple containing:
+                 - A cuDF DataFrame with support information for frequent items ('support_df').
+                 - A new cuDF DataFrame with infrequent items removed and item names
+                   replaced by their new integer IDs ('final_gdf').
+                 Returns (None, None) if no frequent items are found.
+        :rtype: Tuple[cudf.DataFrame, cudf.DataFrame]
+        """
         support_df = gdf.groupby("item").agg({"prob": "sum", "txn_id": "count"}).rename(columns={"txn_id": "freq"})
         support_df = support_df[support_df["prob"] >= self._minSup_scaled].sort_values("freq", ascending=False).reset_index()
         if len(support_df) == 0: return None, None
@@ -348,6 +379,19 @@ class naiveFFIMiner(BaseAlgorithm):
         return support_df, gdf
 
     def _allocate_gpu_hash_tables(self, support_df: cudf.DataFrame) -> np.ndarray:
+        """Allocates memory for hash tables on the GPU.
+
+        Based on the frequency of each item, this method calculates the required size for
+        each hash table on the GPU, applying a load factor to prevent collisions. It then
+        allocates a single contiguous block of memory on the GPU to hold all hash tables
+        and creates a host-side structure that contains pointers and metadata for these tables.
+
+        :param support_df: A cuDF DataFrame containing the support and frequency of each item.
+        :type support_df: cudf.DataFrame
+        :return: A NumPy array of HashTable structures, configured for each item, ready to be
+                 copied to the device.
+        :rtype: np.ndarray
+        """
         freq_cp = support_df["freq"].to_cupy(dtype=cp.uint32)
         needed_size = (freq_cp * INV_LOAD_FACTOR).astype(cp.float32)
         sizes_cp = cp.power(2, cp.ceil(cp.log2(needed_size))).astype(cp.uint32)
@@ -367,6 +411,19 @@ class naiveFFIMiner(BaseAlgorithm):
         return ht_host
 
     def _build_gpu_hash_tables(self, ht_host: np.ndarray, gdf: cudf.DataFrame):
+        """Populates the GPU hash tables with transaction data.
+
+        This method copies the host-side hash table structures to the GPU and then
+        launches a CUDA kernel (``KERN_BUILD``) to insert all transaction data
+        (item IDs, transaction IDs, and probabilities) into the appropriate hash tables
+        on the device.
+
+        :param ht_host: A NumPy array of HashTable structures created by
+                        ``_allocate_gpu_hash_tables``.
+        :type ht_host: np.ndarray
+        :param gdf: The filtered and transformed cuDF DataFrame containing the transaction data.
+        :type gdf: cudf.DataFrame
+        """
         self.item_col = gdf["item"].astype("uint32").values
         self.line_col = gdf["txn_id"].astype("uint32").values
         self.prob_col = gdf["prob"].astype("uint64").values
@@ -376,6 +433,21 @@ class naiveFFIMiner(BaseAlgorithm):
         KERN_BUILD((grid_size,), (self._max_threads,), (total_pairs, self.item_col, self.line_col, self.prob_col, self._ht_dev))
 
     def _generate_next_candidates(self, cands: cp.ndarray, k: int) -> cp.ndarray:
+        """Generates (k+1)-itemset candidates from frequent k-itemsets on the GPU.
+
+        This function implements the candidate generation step of the Apriori algorithm.
+        It takes a set of frequent k-itemsets and generates a new set of (k+1)-itemset
+        candidates. The generation is performed entirely on the GPU using CUDA kernels
+        for efficiency.
+
+        :param cands: A CuPy array of frequent k-itemsets.
+        :type cands: cp.ndarray
+        :param k: The current itemset size.
+        :type k: int
+        :return: A new CuPy array of (k+1)-itemset candidates. Returns an empty array
+                 if no new candidates can be generated.
+        :rtype: cp.ndarray
+        """
         n = len(cands)
         if n == 0: return cp.array([], dtype=cp.uint32)
         grid_size = (n + self._max_threads - 1) // self._max_threads
@@ -389,18 +461,36 @@ class naiveFFIMiner(BaseAlgorithm):
         return nxt
 
     def _get_gpu_memory_usage(self) -> int:
+        """Reports the total GPU memory used by the algorithm.
+
+        :return: The amount of GPU memory used, in bytes. Returns 0 if CUDA is not available
+                 or if the query fails.
+        :rtype: int
+        """
         try:
             free, total = cp.cuda.runtime.memGetInfo()
             return total - free
         except cp.cuda.runtime.CUDARuntimeError: return 0
 
     def save(self, oFile: Union[str, Path]):
-        print(f"Saving patterns to {oFile}...")
+        """Saves the discovered frequent patterns to a file.
+
+        The patterns are written in a text format, with each line containing one
+        itemset. The items in the set are comma-separated, followed by a tab,
+        and then the floating-point support value.
+
+        :param oFile: The path to the output file.
+        :type oFile: Union[str, Path]
+        """
         with open(oFile, "w") as f:
             for itemset, support in self.patterns.items(): f.write(f"{','.join(itemset)}\t{support:.6f}\n")
-        print("Patterns saved.")
 
     def print_results(self):
+        """Prints a summary of the mining results to the console.
+
+        The summary includes execution time, peak CPU and GPU memory usage, and the
+        total number of frequent patterns found.
+        """
         print(f"\n--- {self.__class__.__name__} Results ---")
         print(f"Execution Time: {self.get_execution_time():.4f} seconds")
         print(f"Peak CPU Memory Usage: {self.get_memory_usage():.2f} MB")
@@ -409,10 +499,16 @@ class naiveFFIMiner(BaseAlgorithm):
         print("--------------------" + "-" * len(self.__class__.__name__))
 
 def main():
-    """Main function to run the cuFFIMiner_Adv algorithm from the command line."""
+    """Main function to run the naiveFFIMiner algorithm from the command line.
+
+    This function parses command-line arguments to configure and run the miner.
+    It handles file I/O, instantiates the ``naiveFFIMiner`` class, and prints
+    the final results.
+    """
     parser = argparse.ArgumentParser(description="cuFFIMiner_Adv - A CUDA-based Fuzzy Frequent Itemset Miner with auto-scaling.")
     parser.add_argument("iFile", type=str, help="Path to the input dataset (.txt, .csv, or .parquet).")
     parser.add_argument("min_support", type=float, help="Minimum support threshold as a float (e.g., 0.05).")
+    parser.add_argument("--quant-mult", type=int, default=None, help="Optional external quantization multiplier to force (bypass auto-detect).")
     parser.add_argument("-o", "--oFile", type=str, default="patterns.txt", help="Path to the output file.")
     parser.add_argument("--sep", type=str, default="\t", help="Separator for items in text input files.")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode.")
@@ -426,6 +522,7 @@ def main():
         iFile=args.iFile,
         min_support=args.min_support,
         sep=args.sep,
+        quant_mult=args.quant_mult,
         debug=args.debug
     )
     algorithm.mine()

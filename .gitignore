@@ -11,8 +11,10 @@ __pycache__/
 .DS_Store
 
 # Program
-patterns.txt
-input.txt
+*.txt
 *.csv
 *.prof
 *.parquet
+
+# GDS
+*.log

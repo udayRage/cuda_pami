@@ -148,7 +148,7 @@ class cuFFIMiner(BaseAlgorithm):
                     The keys are tuples of item names, and the values are their fuzzy support.
     """
 
-    def __init__(self, iFile: Union[str, Path, pd.DataFrame], min_support: int, sep: str = "\t", debug: bool = False):
+    def __init__(self, iFile: Union[str, Path, pd.DataFrame], min_support: int, sep: str = "\t", scaling_factor: int = 1, memory_type: str = "global", debug: bool = False):
         """
         Initializes the cuFFIMiner algorithm.
 
@@ -158,17 +158,50 @@ class cuFFIMiner(BaseAlgorithm):
         :type min_support: int
         :param sep: The separator used in text input files.
         :type sep: str
+        :param scaling_factor: The factor used to scale probabilities from fixed-point to floating-point.
+        :type scaling_factor: int
+        :param memory_type: The type of GPU memory to use ('global', 'pinned', 'unified').
+        :type memory_type: str
         :param debug: If True, enables detailed memory and CPU profiling.
         :type debug: bool
         """
+        # check if file is there
+        if not os.path.exists(iFile):
+            raise FileNotFoundError(f"Input file not found: {iFile}")
+
         super().__init__(iFile=iFile, debug=debug)
         if not GPU_AVAILABLE:
             raise RuntimeError("cuFFIMiner requires a GPU with cuDF and CuPy installed.")
 
+        self._configure_memory_pool(memory_type)
+
         self._minSup_scaled = min_support
+        self._scaling_factor = scaling_factor
         self._sep = sep
         self._gpu_memory_usage = 0
         self.patterns: Dict[Tuple[str, ...], float] = {}
+
+    def _configure_memory_pool(self, memory_type: str):
+        """
+        Configure device allocations, and (optionally) enable a pinned host pool.
+        memory_type: 'global' | 'unified' | 'global+pinned' | 'unified+pinned'
+        """
+        use_pinned = memory_type.endswith("+pinned")
+        base = memory_type.replace("+pinned", "")
+
+        if base == "global":
+            dpool = cp.cuda.MemoryPool()                       # device allocations
+            cp.cuda.set_allocator(dpool.malloc)
+        elif base == "unified":
+            dpool = cp.cuda.MemoryPool(cp.cuda.malloc_managed) # device allocations (UM)
+            cp.cuda.set_allocator(dpool.malloc)
+        else:
+            raise ValueError(f"Invalid memory type '{memory_type}'. "
+                            "Use 'global', 'unified', optionally with '+pinned'.")
+
+        if use_pinned:
+            ppool = cp.cuda.PinnedMemoryPool()                 # host pinned allocations
+            cp.cuda.set_pinned_memory_allocator(ppool.malloc)
 
     def _load_data(self) -> cudf.DataFrame:
         """
@@ -177,7 +210,6 @@ class cuFFIMiner(BaseAlgorithm):
         :return: A cuDF DataFrame with list columns for 'items' and 'values'.
         :rtype: cudf.DataFrame
         """
-        print("Loading transactional text data into GPU...")
         gdf = cudf.read_csv(str(self._iFile), sep=":", header=None, names=["items", "values"], dtype=["str", "str"])
         sep_esc = re.escape(self._sep)
         pattern = rf"[{sep_esc}\r\n ]+$"
@@ -203,7 +235,6 @@ class cuFFIMiner(BaseAlgorithm):
         :return: A validated cuDF DataFrame in the required long format.
         :rtype: cudf.DataFrame
         """
-        print("Loading pre-processed Parquet data...")
         gdf = cudf.read_parquet(str(self._iFile))
         
         REQUIRED_COLUMNS = ["item", "prob", "txn_id"]
@@ -253,8 +284,8 @@ class cuFFIMiner(BaseAlgorithm):
                  - The main DataFrame with infrequent items removed and IDs updated.
         :rtype: Tuple[cudf.DataFrame, cudf.DataFrame]
         """
-        # The logic of this function remains the same, as it operates on the exploded_gdf format
         support_df = gdf.groupby("item").agg({"prob": "sum", "txn_id": "count"}).rename(columns={"txn_id": "freq"})
+
         support_df = support_df[support_df["prob"] >= self._minSup_scaled].sort_values("freq", ascending=False).reset_index()
 
         if len(support_df) == 0: return None, None
@@ -273,9 +304,7 @@ class cuFFIMiner(BaseAlgorithm):
         self.support_df = support_df
         return support_df, gdf
 
-    # The following helper methods are unchanged as they operate on the processed dataframes
     def _allocate_gpu_hash_tables(self, support_df: cudf.DataFrame) -> np.ndarray:
-        # ... (This method's implementation is identical to the previous version) ...
         freq_cp = support_df["freq"].to_cupy(dtype=cp.uint32)
         needed_size = (freq_cp * INV_LOAD_FACTOR).astype(cp.float32)
         sizes_cp = cp.power(2, cp.ceil(cp.log2(needed_size))).astype(cp.uint32)
@@ -296,7 +325,6 @@ class cuFFIMiner(BaseAlgorithm):
 
 
     def _build_gpu_hash_tables(self, ht_host: np.ndarray, gdf: cudf.DataFrame):
-        # ... (This method's implementation is identical to the previous version) ...
         self.item_col = gdf["item"].astype("uint32").values
         self.line_col = gdf["txn_id"].astype("uint32").values
         self.prob_col = gdf["prob"].astype("uint64").values
@@ -310,7 +338,6 @@ class cuFFIMiner(BaseAlgorithm):
         """
         Orchestrates the main mining process, handling both Parquet and text inputs.
         """
-        # --- 1. Load and Prepare Data based on file type ---
         is_parquet = isinstance(self._iFile, (str, Path)) and str(self._iFile).lower().endswith(".parquet")
         
         if is_parquet:
@@ -319,25 +346,20 @@ class cuFFIMiner(BaseAlgorithm):
             raw_gdf = self._load_data()
             exploded_gdf = self._explode_transactions(raw_gdf)
         
-        # --- 2. Filter Items and Setup for GPU ---
         support_df, final_gdf = self._calculate_support_and_filter_items(exploded_gdf)
         if support_df is None:
-            print("No frequent items found after filtering. Exiting.")
             self.patterns = {}
             return
             
-        # --- 3. Allocate and Build GPU Data Structures ---
-        print("Allocating and building GPU hash tables...")
         ht_host = self._allocate_gpu_hash_tables(support_df)
         self._build_gpu_hash_tables(ht_host, final_gdf)
 
-        # --- 4. Iterative Mining on GPU (Unchanged) ---
-        print("Mining frequent patterns on GPU...")
         k = 1
         candidates = self.support_df["new_id"].to_cupy().reshape(-1, 1)
         gpu_results = []
         while len(candidates) > 0:
-            if self.debug: print(f"Mining {k+1}-itemsets from {len(candidates)} candidates...")
+            if self.debug: 
+                print(f"Mining {k+1}-itemsets from {len(candidates)} candidates...")
             next_candidates = self._generate_next_candidates(candidates, k)
             if len(next_candidates) == 0: break
             k += 1
@@ -346,19 +368,19 @@ class cuFFIMiner(BaseAlgorithm):
             cp.cuda.runtime.deviceSynchronize()
             mask = supports >= self._minSup_scaled
             frequent_cands = next_candidates[mask]
-            if len(frequent_cands) > 0: gpu_results.append((frequent_cands.get(), supports[mask].get()))
+            if len(frequent_cands) > 0: 
+                gpu_results.append(
+                    (frequent_cands.get(), supports[mask].get())
+                )
             candidates = frequent_cands
 
-        # --- 5. Process Results and Cleanup (Unchanged) ---
         self._process_results(gpu_results)
         self._gpu_memory_usage = self._get_gpu_memory_usage()
         del self.item_col, self.line_col, self.prob_col, self._ht_dev, self.buckets
         del self.support_df, self.rename_map
         cp.get_default_memory_pool().free_all_blocks()
 
-    # The following methods are unchanged
     def _generate_next_candidates(self, cands: cp.ndarray, k: int) -> cp.ndarray:
-        # ... (This method's implementation is identical to the previous version) ...
         n = len(cands)
         if n == 0: return cp.array([], dtype=cp.uint32)
         grid_size = (n + self._max_threads - 1) // self._max_threads
@@ -372,32 +394,26 @@ class cuFFIMiner(BaseAlgorithm):
         return nxt
 
     def _process_results(self, gpu_results):
-        # ... (This method's implementation is identical to the previous version) ...
-        print("Processing and decoding results...")
-        patterns = {(item,): float(prob) for item, prob in zip(self.support_df["item"].to_numpy(), self.support_df["prob"].to_numpy())}
+        patterns = {(item,): float(prob) for item, prob in zip(self.support_df["item"].to_numpy(), self.support_df["prob"].to_numpy() / self._scaling_factor)}
         for ids_cpu, vals in gpu_results:
+            # ensure supports are floating-point and avoid integer division issues
+            vals = np.asarray(vals).astype(np.float64) / float(self._scaling_factor)
             names = self.rename_map[ids_cpu]
             for name_tuple, sup in zip(names, vals):
                 patterns[tuple(name_tuple)] = float(sup)
         self.patterns = patterns
-        print(f"\nTotal frequent patterns found: {len(self.patterns)}")
 
     def _get_gpu_memory_usage(self) -> int:
-        # ... (This method's implementation is identical to the previous version) ...
         try:
             free, total = cp.cuda.runtime.memGetInfo()
             return total - free
         except cp.cuda.runtime.CUDARuntimeError: return 0
 
     def save(self, oFile: Union[str, Path]):
-        # ... (This method's implementation is identical to the previous version) ...
-        print(f"Saving patterns to {oFile}...")
         with open(oFile, "w") as f:
             for itemset, support in self.patterns.items(): f.write(f"{','.join(itemset)}\t{support}\n")
-        print("Patterns saved.")
 
     def print_results(self):
-        # ... (This method's implementation is identical to the previous version) ...
         print(f"\n--- {self.__class__.__name__} Results ---")
         print(f"Execution Time: {self.get_execution_time():.4f} seconds")
         print(f"Peak CPU Memory Usage: {self.get_memory_usage():.2f} MB")
@@ -410,8 +426,10 @@ def main():
     parser = argparse.ArgumentParser(description="cuFFIMiner - A CUDA-based Fuzzy Frequent Itemset Miner for pre-scaled integer data.")
     parser.add_argument("iFile", type=str, help="Path to the input dataset (.txt, .csv, or .parquet).")
     parser.add_argument("min_support", type=int, help="Minimum support threshold as a scaled integer (e.g., 100).")
+    parser.add_argument("scaling_factor", type=int, help="Scaling factor for the input data. Will be used to scale down the output, fixed->floating")
     parser.add_argument("-o", "--oFile", type=str, default="patterns.txt", help="Path to the output file.")
     parser.add_argument("--sep", type=str, default="\t", help="Separator for items in text input files.")
+    parser.add_argument("--mem_type", type=str, default="global", choices=["global", "pinned", "unified"], help="Type of GPU memory to use (global, pinned, unified).")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode.")
     args = parser.parse_args()
 
@@ -423,6 +441,8 @@ def main():
         iFile=args.iFile,
         min_support=args.min_support,
         sep=args.sep,
+        scaling_factor=args.scaling_factor,
+        memory_type=args.mem_type,
         debug=args.debug
     )
     algorithm.mine()

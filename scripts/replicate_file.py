@@ -17,35 +17,80 @@ def parse_times(xstr: str) -> int:
         raise ValueError("Multiplier must be >= 1")
     return n
 
-def main():
-    ap = argparse.ArgumentParser(
-        description="Write a new file containing N total copies of the original content; name as *_rep{N}.ext"
-    )
-    ap.add_argument("file", help="Path to the text file")
-    ap.add_argument("times", help="Total copies, e.g., '2x' or '3' → rep2 / rep3")
-    args = ap.parse_args()
+def replicate_file(input_path_str: str, times: int, output_path_str: str = None) -> str:
+    """Concatenate the file with itself *times* producing a dataset-level scaling factor (SF).
 
-    path = Path(args.file)
+    Terminology update:
+        SF (scaling factor) == number of concatenations (replications) performed.
+        Output naming (if not provided):
+            <stem>_SF{times}_floating<suffix>
+
+    Examples:
+        input.csv  + times=5 -> input_SF5_floating.csv
+
+    If *times* == 1 we still create the canonical *SF1* copy (unless it already exists)
+    so downstream code can rely uniformly on the naming pattern without special cases.
+
+    Parameters
+    ----------
+    input_path_str : str
+        Path to source text file.
+    times : int
+        Total number of concatenations (>=1).
+    output_path_str : str, optional
+        Explicit output path. If given, overrides automatic naming.
+
+    Returns
+    -------
+    str
+        Path to replicated (floating) file.
+    """
+    path = Path(input_path_str)
     if not path.exists():
-        print(f"File not found: {path}", file=sys.stderr)
-        sys.exit(1)
+        raise FileNotFoundError(f"Input file not found: {path}")
 
-    n = parse_times(args.times)
+    if times < 1:
+        raise ValueError("Multiplier must be >= 1")
+
     text = path.read_text(encoding="utf-8")
 
     # Ensure copies are cleanly separated even if the file lacks a trailing newline.
     needs_nl = (len(text) > 0 and not text.endswith("\n"))
     base = text + ("\n" if needs_nl else "")
-    repeated = base * n
+    repeated = base * times
     # If we added a newline for separation, but original had none, and you want to preserve
     # the final “no newline at EOF” semantics, you could strip the trailing one:
     if needs_nl and repeated.endswith("\n"):
         repeated = repeated[:-1]
 
-    out_path = path.with_name(f"{path.stem}_rep{n}{path.suffix or ''}")
+    if output_path_str:
+        out_path = Path(output_path_str)
+    else:
+        # New canonical naming
+        out_path = path.with_name(f"{path.stem}_SF{times}_floating{path.suffix or ''}")
+    
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(repeated, encoding="utf-8")
+    print(f"[replicate] Wrote: {out_path} (SF={times})")
+    
+    return str(out_path)
 
-    print(f"Wrote: {out_path} (contains {n}× the original content)")
+def main():
+    """Main function for command-line execution."""
+    parser = argparse.ArgumentParser(
+        description="Write a new file containing N total copies of the original content."
+    )
+    parser.add_argument("file", help="Path to the text file.")
+    parser.add_argument("times", help="Total copies, e.g., '2x' or '3'.")
+    parser.add_argument("output_file", nargs='?', default=None, help="Optional. Path to the output file.")
+    args = parser.parse_args()
+
+    try:
+        n = parse_times(args.times)
+        replicate_file(args.file, n, args.output_file)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
