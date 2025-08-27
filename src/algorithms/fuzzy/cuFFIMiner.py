@@ -173,6 +173,8 @@ class cuFFIMiner(BaseAlgorithm):
         if not GPU_AVAILABLE:
             raise RuntimeError("cuFFIMiner requires a GPU with cuDF and CuPy installed.")
 
+        self._dpool = None
+        self._ppool = None
         self._configure_memory_pool(memory_type)
 
         self._minSup_scaled = min_support
@@ -190,18 +192,18 @@ class cuFFIMiner(BaseAlgorithm):
         base = memory_type.replace("+pinned", "")
 
         if base == "global":
-            dpool = cp.cuda.MemoryPool()                       # device allocations
-            cp.cuda.set_allocator(dpool.malloc)
+            self._dpool = cp.cuda.MemoryPool()                       # device allocations
+            cp.cuda.set_allocator(self._dpool.malloc)
         elif base == "unified":
-            dpool = cp.cuda.MemoryPool(cp.cuda.malloc_managed) # device allocations (UM)
-            cp.cuda.set_allocator(dpool.malloc)
+            self._dpool = cp.cuda.MemoryPool(cp.cuda.malloc_managed) # device allocations (UM)
+            cp.cuda.set_allocator(self._dpool.malloc)
         else:
             raise ValueError(f"Invalid memory type '{memory_type}'. "
                             "Use 'global', 'unified', optionally with '+pinned'.")
 
         if use_pinned:
-            ppool = cp.cuda.PinnedMemoryPool()                 # host pinned allocations
-            cp.cuda.set_pinned_memory_allocator(ppool.malloc)
+            self._ppool = cp.cuda.PinnedMemoryPool()                 # host pinned allocations
+            cp.cuda.set_pinned_memory_allocator(self._ppool.malloc)
 
     def _load_data(self) -> cudf.DataFrame:
         """
@@ -378,7 +380,15 @@ class cuFFIMiner(BaseAlgorithm):
         self._gpu_memory_usage = self._get_gpu_memory_usage()
         del self.item_col, self.line_col, self.prob_col, self._ht_dev, self.buckets
         del self.support_df, self.rename_map
-        cp.get_default_memory_pool().free_all_blocks()
+        
+        if self._dpool:
+            self._dpool.free_all_blocks()
+        if self._ppool:
+            self._ppool.free_all_blocks()
+        
+        # Reset to default allocator
+        cp.cuda.set_allocator(None)
+        cp.cuda.set_pinned_memory_allocator(None)
 
     def _generate_next_candidates(self, cands: cp.ndarray, k: int) -> cp.ndarray:
         n = len(cands)

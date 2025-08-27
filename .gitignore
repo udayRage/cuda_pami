@@ -12,7 +12,7 @@ __pycache__/
 
 # Program
 *.txt
-*.csv
+Fuzzy*.csv
 *.prof
 *.parquet
 

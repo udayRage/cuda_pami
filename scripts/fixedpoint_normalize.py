@@ -1,186 +1,188 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import argparse
-import re
-import shutil
-from decimal import Decimal, getcontext, localcontext
 from pathlib import Path
-from typing import Tuple, Literal
-import sys
-import time
+import re
+import math
+from typing import Tuple, Optional
+from decimal import Decimal
 
-# NOTE: Previously we only matched numbers that already had a decimal point, so
-# plain integers (e.g. "5") were left unscaled while "5.0" became scaled. That
-# produced mixed scaling in the fixed output. We now match ALL numbers (ints or
-# floats) and apply the quantization multiplier uniformly so fixed-point values
-# are consistent.
+try:
+    import cudf
+    import cupy as cp
+    _CUDF_AVAILABLE = True
+except ImportError:
+    _CUDF_AVAILABLE = False
+    raise SystemExit('cuDF not available; install RAPIDS to use this script.')
+    
+try:
+    import pandas as pd
+except ImportError:
+    pass
 
-NUMBER_RE = re.compile(
-    r"""
-    (?P<num>
-      (?<!\w)            # not preceded by word char
-      [+-]?               # optional sign
-      (?:
-         \d+\.\d+       # digits.digits
-        |\d+             # or just integer digits
-        |\.\d+          # or leading-decimal like .5
-      )
-      (?!\w)             # not followed by word char
-    )
-    """,
-    re.VERBOSE,
-)
+def _infer_sf_and_paths(floating_path: Path) -> Tuple[str, Path, Path, Path, Path]:
+    stem = floating_path.stem
+    m = re.search(r"_SF(\d+)_floating$", stem)
+    if m:
+        sf = m.group(1)
+        base = stem.replace(f"_SF{sf}_floating", f"_SF{sf}")
+    else:
+        sf = '1'
+        base = stem + '_SF1'
+    fixed_text = floating_path.with_name(f"{base}_fixed{floating_path.suffix}")
+    fixed_parquet = fixed_text.with_suffix('.parquet')
+    floating_parquet = floating_path.with_suffix('.parquet')
+    quant_file = floating_path.with_name(f"{base}_quant_mult.txt")
+    return base, fixed_text, fixed_parquet, floating_parquet, quant_file
 
-def count_decimal_places(s: str) -> int:
-    if "." not in s:
-        return 0
-    s2 = s.lstrip("+-")
-    if "." not in s2:
-        return 0
-    _, frac = s2.split(".", 1)
-    frac = frac.rstrip("0")
-    return len(frac)
+def gpu_fixedpoint_pipeline(
+    floating_path_str: str,
+    write_fixed_text: bool = True,
+    force: bool = False,
+    prefer_float32: bool = True,
+    min_sup: Optional[float] = None,
+) -> Tuple[str, str, str, int]:
+    """Run full GPU pipeline.
 
-def normalize_file(
-    input_path_str: str,
-    output_path_str: str = None,
-    method: Literal['fast','legacy'] = 'fast',
-    progress: bool = True,
-    progress_every: int = 250000,
-) -> Tuple[str, int]:
-    """Convert *all* numeric probabilities (ints & floats) to a uniform fixed-point integer domain.
-
-    Performance:
-      - fast  : Two streaming passes (O(file size)), no huge in-memory string, no Decimal arithmetic.
-                Suitable for multi-GB files. Only stores small rewrite buffers per line.
-      - legacy: Original in-memory regex + Decimal approach (kept for reproducibility / validation).
-
-    Returns (fixed_file_path, quant_mult).
+    Returns (fixed_text_path, fixed_parquet_path, floating_parquet_path, quant_mult)
     """
-    in_path = Path(input_path_str)
-    if not in_path.exists():
-        raise FileNotFoundError(f"Input file not found: {in_path}")
+    floating_path = Path(floating_path_str)
+    if not floating_path.exists():
+        raise FileNotFoundError(f"Input floating file not found: {floating_path}")
+    base, fixed_text, fixed_parquet, floating_parquet, quant_file = _infer_sf_and_paths(floating_path)
 
-    # Derive SF & output naming early
-    stem = in_path.stem
-    m_sf = re.search(r"_SF(\d+)_floating$", stem)
-    if m_sf:
-        sf_val = m_sf.group(1)
-        base_stem = stem.replace(f"_SF{sf_val}_floating", f"_SF{sf_val}")
+    if (fixed_parquet.exists() and floating_parquet.exists() and quant_file.exists()) and not force:
+        if write_fixed_text and not fixed_text.exists():
+            print("Warning: Fixed text file is missing. Re-running the pipeline to generate it.")
+        else:
+            quant_mult = int(quant_file.read_text().strip())
+            print(f"[gpu-pipeline] done reuse quant_mult={quant_mult} file={fixed_parquet}")
+            return str(fixed_text), str(fixed_parquet), str(floating_parquet), quant_mult
+
+    df = cudf.read_csv(
+        floating_path,
+        sep=":",
+        names=["items", "values"],
+        header=None,
+        dtype=["str", "str"],
+        skip_blank_lines=True,
+    ).fillna("")
+    
+    ws_pat = r"[\t\r\n ]+$"
+    df["items"] = df["items"].str.replace(ws_pat, "", regex=True)
+    df["values"] = df["values"].str.replace(ws_pat, "", regex=True)
+
+    # Generate 1-based transaction IDs; use cudf.RangeIndex for compatibility across RAPIDS versions
+    df['txn_id'] = (cudf.Series(cudf.RangeIndex(start=0, stop=len(df))) + 1).astype("uint32")
+    
+    df_long = cudf.DataFrame({
+        'item': df['items'].str.split('\t').explode(),
+        'prob_str': df['values'].str.split('\t').explode(),
+        'txn_id': df['txn_id'].repeat(df['items'].str.count('\t') + 1),
+    }).dropna().reset_index(drop=True)
+    
+    df_long = df_long[df_long['item'] != ''].reset_index(drop=True)
+
+    # Determine maximum number of decimal places present
+    decimals_each = df_long["prob_str"].str.partition(".")[2].fillna("").str.len().fillna(0)
+    max_sf = int(decimals_each.max())
+
+    if min_sup is not None:
+        raw_min_sup = Decimal(str(min_sup))
+        if raw_min_sup.as_tuple().exponent < 0:
+            max_sf = max(max_sf, -raw_min_sup.as_tuple().exponent)
+
+    quant_mult = 10 ** max_sf
+
+    parts = df_long["prob_str"].str.partition(".")
+    int_part = parts[0].fillna("0")
+    if max_sf > 0:
+        frac_part_raw = parts[2].fillna("")
+        # slice to max_sf then right-pad with zeros
+        frac_scaled_str = frac_part_raw.str.slice(stop=max_sf).str.pad(width=max_sf, side='right', fillchar='0')
+        # All entries are digits (possibly "0" * max_sf)
+        scaled = int_part.astype("int64") * quant_mult + frac_scaled_str.astype("int64")
     else:
-        sf_val = "1"
-        base_stem = stem + "_SF1"
-    if output_path_str:
-        out_path = Path(output_path_str)
+        scaled = int_part.astype("int64")
+
+    df_long["prob"] = scaled.astype("uint64")
+    
+    if int(df_long['prob'].max()) >= 2**32:
+        raise OverflowError("Scaled probabilities exceed uint32 range.")
+    df_long['prob'] = df_long['prob'].astype('uint32')
+    
+    df_long['prob_float'] = df_long['prob_str'].astype('float64')
+    if prefer_float32:
+        float_out = df_long[['item', 'prob_float', 'txn_id']].rename(columns={'prob_float': 'prob'})
+        float_out['prob'] = float_out['prob'].astype('float32')
     else:
-        out_path = in_path.with_name(f"{base_stem}_fixed{in_path.suffix or ''}")
-    quant_sidecar = out_path.with_name(f"{base_stem}_quant_mult.txt")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+        float_out = df_long[['item', 'prob_float', 'txn_id']].rename(columns={'prob_float': 'prob'})
 
-    if method == 'legacy':
-        text = in_path.read_text(encoding="utf-8")
-        numbers = [m.group("num") for m in NUMBER_RE.finditer(text)]
-        max_places = max((count_decimal_places(s) for s in numbers), default=0)
-        quant_mult = 10 ** max_places
-        if quant_mult != 1:
-            getcontext().prec = 100
-            with localcontext() as ctx:
-                ctx.prec = 100
-                scale_dec = Decimal(quant_mult)
-                def repl(m: re.Match) -> str:
-                    d = Decimal(m.group("num"))
-                    scaled = d * scale_dec
-                    return str(int(scaled.to_integral_value(rounding=ctx.rounding)))
-                new_text = NUMBER_RE.sub(repl, text)
-        else:
-            new_text = text
-        out_path.write_text(new_text, encoding='utf-8')
-        quant_sidecar.write_text(str(quant_mult) + "\n", encoding='utf-8')
-        print(f"[normalize] done method=legacy quant_mult={quant_mult} file={out_path}")
-        return str(out_path), quant_mult
+    float_out.to_parquet(floating_parquet, compression='zstd')
 
-    # FAST streaming path
-    t0 = time.time()
-    max_places = 0
-    total_numbers = 0
-    total_lines = 0
-    with in_path.open('r', encoding='utf-8', errors='replace') as fh:
-        for line in fh:
-            total_lines += 1
-            for m in NUMBER_RE.finditer(line):
-                total_numbers += 1
-                places = count_decimal_places(m.group('num'))
-                if places > max_places:
-                    max_places = places
-    quant_mult = 10 ** max_places
+    fixed_out = df_long[['item', 'prob', 'txn_id']]
+    fixed_out.to_parquet(fixed_parquet, compression='zstd')
 
-    if quant_mult == 1:
-        shutil.copyfile(in_path, out_path)
-        quant_sidecar.write_text("1\n", encoding='utf-8')
-        print(f"[normalize] done method=fast quant_mult=1 file={out_path}")
-        return str(out_path), 1
+    if write_fixed_text:
+        grouped = fixed_out.to_pandas().groupby('txn_id')
+        with fixed_text.open('w', encoding='utf-8') as ft:
+            for _, sub in grouped:
+                items = sub['item'].tolist()
+                probs = sub['prob'].tolist()
+                ft.write('\t'.join(items) + ':' + '\t'.join(str(p) for p in probs) + '\n')
+    
+    quant_file.write_text(str(quant_mult) + '\n', encoding='utf-8')
+    print(f"[gpu-pipeline] done rows={len(fixed_out)} quant_mult={quant_mult} fixed_parquet={fixed_parquet} floating_parquet={floating_parquet}")
 
-    # Precompute string of multiplier for optimization? (not needed) – implement scaling function.
-    def scale_number_str(num_str: str) -> str:
-        # Preserve sign
-        sign = 1
-        if num_str.startswith(('+','-')):
-            if num_str[0] == '-':
-                sign = -1
-            num_body = num_str[1:]
-        else:
-            num_body = num_str
-        if '.' in num_body:
-            int_part, frac_part = num_body.split('.', 1)
-        else:
-            int_part, frac_part = num_body, ''
-        # Remove leading empties (for forms like .5)
-        if int_part == '':
-            int_part = '0'
-        # Pad frac_part to max_places (dataset ensures we won't exceed)
-        frac_padded = frac_part.ljust(max_places, '0')
-        scaled_val = sign * (int(int_part) * quant_mult + (int(frac_padded[:max_places]) if max_places else 0))
-        return str(scaled_val)
+    return str(fixed_text), str(fixed_parquet), str(floating_parquet), quant_mult
 
-    # Second pass write
-    written_numbers = 0
-    with in_path.open('r', encoding='utf-8', errors='replace') as src, out_path.open('w', encoding='utf-8') as dst:
-        for line_idx, line in enumerate(src, start=1):
-            # Replace numbers via manual scan (avoid building huge intermediate list)
-            last_end = 0
-            out_chunks = []
-            for m in NUMBER_RE.finditer(line):
-                out_chunks.append(line[last_end:m.start()])
-                out_chunks.append(scale_number_str(m.group('num')))
-                last_end = m.end()
-                written_numbers += 1
-            out_chunks.append(line[last_end:])
-            dst.write(''.join(out_chunks))
-            # Suppress incremental progress prints (kept minimal as requested)
 
-    quant_sidecar.write_text(str(quant_mult) + "\n", encoding='utf-8')
-    t1 = time.time()
-    print(f"[normalize] done method=fast quant_mult={quant_mult} numbers={written_numbers} seconds={t1 - t0:.2f} file={out_path}")
-    return str(out_path), quant_mult
+def normalize_file(input_path_str: str, output_path_str: str | None = None, progress: bool = True, write_fixed_text: bool = True):
+    """Backward-compatible wrapper that produces fixed text + quant_mult.
+
+    Parameters
+    ----------
+    input_path_str : str
+        Path to floating transactional file (items	...:vals). Should include _floating in name for canonical naming.
+    output_path_str : str | None
+        Optional explicit fixed text output path (else pipeline naming used). If provided and differs, file is copied.
+    progress : bool
+        Ignored (kept for signature compatibility).
+    write_fixed_text : bool
+        If False, skips writing the text file and returns the parquet path instead.
+
+    Returns
+    -------
+    (path, quant_mult)
+        path is fixed_text_path if write_fixed_text is True, else fixed_parquet_path
+    """
+    fixed_txt, fixed_parq, float_parq, qm = gpu_fixedpoint_pipeline(input_path_str, write_fixed_text=write_fixed_text, force=False)
+    if not write_fixed_text:
+        return fixed_parq, qm
+
+    if output_path_str and output_path_str != fixed_txt:
+        # copy to user-requested location
+        Path(output_path_str).write_text(Path(fixed_txt).read_text())
+        fixed_txt = output_path_str
+    return fixed_txt, qm
+
 
 def main():
-    """Main function for command-line execution."""
-    parser = argparse.ArgumentParser(
-        description="Scale all decimal numbers in a file so they become integers."
-    )
-    parser.add_argument("input_file", help="Path to the input text file.")
-    parser.add_argument("output_file", nargs='?', default=None, help="Optional. Path to the output file.")
-    parser.add_argument("--method", choices=['fast','legacy'], default='fast', help="Normalization method (fast streaming or legacy Decimal).")
-    parser.add_argument("--no-progress", action='store_true', help="Disable periodic progress output.")
-    parser.add_argument("--progress-every", type=int, default=250000, help="Lines interval for progress messages (fast mode).")
-    args = parser.parse_args()
-
-    normalize_file(
-        args.input_file,
-        args.output_file,
-        method=args.method,
-        progress=not args.no_progress,
-        progress_every=args.progress_every,
+    ap = argparse.ArgumentParser(description="GPU fixed-point + parquet pipeline (cuDF)")
+    ap.add_argument('floating_file', help='Path to *_floating.csv source')
+    ap.add_argument('--no-fixed-text', action='store_true', help='Skip writing fixed text file (only parquets)')
+    ap.add_argument('--force', action='store_true', help='Rebuild even if outputs exist')
+    ap.add_argument('--float64', action='store_true', help='Keep floating parquet in float64 (default float32)')
+    ap.add_argument('--min-sup', type=float, help='Minimum support value to consider for scaling factor.')
+    args = ap.parse_args()
+    
+    gpu_fixedpoint_pipeline(
+        args.floating_file,
+        write_fixed_text=not args.no_fixed_text,
+        force=args.force,
+        prefer_float32=not args.float64,
+        min_sup=args.min_sup,
     )
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
