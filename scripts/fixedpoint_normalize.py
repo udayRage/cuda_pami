@@ -7,6 +7,14 @@ import math
 from typing import Tuple, Optional
 from decimal import Decimal
 
+
+import rmm
+
+# Use Unified Memory + a pool (pool reduces allocator overhead)
+rmm.reinitialize(
+    managed_memory=True,    # <-- Unified Memory
+)
+
 try:
     import cudf
     import cupy as cp
