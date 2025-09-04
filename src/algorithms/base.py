@@ -54,7 +54,7 @@ class BaseAlgorithm(ABC):
         self._start_time = None
         self._execution_time = None
         self._memory_usage = None
-        self.debug = debug
+        self._debug = debug
 
     def record_start_time(self):
         """Records the start time for performance measurement."""
@@ -82,14 +82,14 @@ class BaseAlgorithm(ABC):
         """
         self.record_start_time()
 
-        if self.debug:
+        if self._debug:
             tracemalloc.start()
             profiler = cProfile.Profile()
             profiler.enable()
 
         self._mine()
 
-        if self.debug:
+        if self._debug:
             profiler.disable()
             profile_filename = f"{self.__class__.__name__}.prof"
             profiler.dump_stats(profile_filename)

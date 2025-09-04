@@ -13,6 +13,7 @@ __pycache__/
 # Program
 *.txt
 Fuzzy*.csv
+Transactional*.csv
 *.prof
 *.parquet
 *.err
