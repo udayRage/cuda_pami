@@ -18,6 +18,8 @@ Transactional*.csv
 *.parquet
 *.err
 *.out
+src/extra/io/build/
+data/synthetic/
 
 # GDS
 *.log

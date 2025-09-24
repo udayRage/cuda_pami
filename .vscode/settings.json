@@ -1,0 +1,7 @@
+{
+    "cmake.sourceDirectory": "/export/home1/ltarun/cuda_pami/src/extra/io",
+    "files.associations": {
+        "cerrno": "cpp",
+        "string": "cpp"
+    }
+}
