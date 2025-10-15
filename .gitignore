@@ -23,3 +23,9 @@ data/synthetic/
 
 # GDS
 *.log
+
+scripts/io/benchmark_output/*.csv
+scripts/io/out_all_shapes/*.csv
+scripts/io/out_all_shapes/*.parquet
+scripts/io/out_all_shapes/*.zip
+scripts/io/out_all_shapes/*.gz

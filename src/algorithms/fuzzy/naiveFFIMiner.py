@@ -79,14 +79,31 @@ __device__ __forceinline__ uint64_t ullmin_dev(uint64_t a, uint64_t b){ return (
 extern "C" __global__ void number_of_new_candidates_to_generate(const uint32_t *c, uint32_t n, uint32_t k, uint32_t *out){
     uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; if (i >= n) return;
     if (k == 1) { out[i+1] = n - i - 1; return; }
+
+    uint32_t count = 0;
     for (uint32_t j = i + 1; j < n; ++j){
         bool same = true;
         for (uint32_t l = 0; l < k - 1; ++l){
             if (c[i*k+l] != c[j*k+l]) { same = false; break; }
         }
-        if (same) atomicAdd(&out[i+1], 1u);
+        // if (same) atomicAdd(&out[i+1], 1u);
+        if (same) count++;
+    }
+
+    out[i+1] = count;
+}
+
+
+extern "C" __global__ void write_the_new_candidates(const uint32_t *c, uint32_t n, uint32_t k, const uint32_t *idx, uint32_t *out){
+    uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; if (i >= n) return;
+    uint32_t slice = idx[i+1] - idx[i]; if (!slice) return;
+    uint32_t base = idx[i] * (k + 1);
+    for (uint32_t j = 0; j < slice; ++j){
+        for (uint32_t l = 0; l < k; ++l){ out[base + j*(k+1) + l] = c[i*k+l]; }
+        out[base + j*(k+1) + k] = c[(i+1+j)*k + (k-1)];
     }
 }
+
 
 extern "C" __global__ void write_dense_arrays(
     uint64_t total,
@@ -102,16 +119,6 @@ extern "C" __global__ void write_dense_arrays(
     if (pos < hts[it].arr_len){
         hts[it].arr[pos].line        = lines[tid];
         hts[it].arr[pos].probability = probs[tid];
-    }
-}
-
-extern "C" __global__ void write_the_new_candidates(const uint32_t *c, uint32_t n, uint32_t k, const uint32_t *idx, uint32_t *out){
-    uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; if (i >= n) return;
-    uint32_t slice = idx[i+1] - idx[i]; if (!slice) return;
-    uint32_t base = idx[i] * (k + 1);
-    for (uint32_t j = 0; j < slice; ++j){
-        for (uint32_t l = 0; l < k; ++l){ out[base + j*(k+1) + l] = c[i*k+l]; }
-        out[base + j*(k+1) + k] = c[(i+1+j)*k + (k-1)];
     }
 }
 
@@ -609,6 +616,8 @@ class naiveFFIMiner(BaseAlgorithm):
         candidates = cp.asarray(self.support_df["new_id"].to_numpy()).reshape(-1, 1)
         gpu_results = []
         while len(candidates) > 0:
+            print(f"--- k={k} candidates: {len(candidates)} ---")
+
             # START state (only static + current candidates)
             self._record_manual_report(f"k={k}/start", static_map=static_map, candidates=candidates)
 

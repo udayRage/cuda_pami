@@ -47,7 +47,7 @@ bool parse_cli(int argc, char** argv, Options &opt) {
         ("help,h", "show help")
         ("file", po::value<string>()->required(), "input file (positional)")
         ("threads,t", po::value<int>()->default_value(0), "number of parse threads (0=OpenMP default)")
-        ("queue-depth,q", po::value<int>()->default_value(64), "io_uring queue depth")
+        ("queue-depth,q", po::value<int>()->default_value(64), "io_uring queue depth per thread")
         ("io-size-kb,i", po::value<int>()->default_value(1024), "IO size per request (KB)")
         ("block-size,b", po::value<int>()->default_value(0), "alignment block size in bytes (0 => filesystem default)")
         ("delim,d", po::value<char>()->default_value(','), "delimiter for parse stage")
@@ -162,126 +162,129 @@ pair<uint64_t,double> run_parse_stage(const void* buffer, size_t file_size, int 
     return { total_numbers, chrono::duration<double>(t1 - t0).count() };
 }
 
-// ---------- I/O with retries ----------
-double submit_and_wait_reads_with_retries(int fd, struct io_uring &ring, void* buffer,
-        size_t file_size, size_t io_chunk, int queue_depth,
-        atomic<size_t>& error_count, int max_retries) {
+// ---------- I/O with retries (per-thread) ----------
+void read_chunk_parallel(int fd, void* buffer, size_t file_size, size_t io_chunk,
+                         int queue_depth, int max_retries, atomic<size_t>& error_count) {
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int num_threads = omp_get_num_threads();
+        size_t total_chunks = (file_size + io_chunk - 1) / io_chunk;
 
-    size_t chunks = (file_size + io_chunk - 1) / io_chunk;
-    // ensure alloc_size = chunks * io_chunk is available in buffer (caller does)
-    vector<int> retries(chunks, 0);
-    vector<char> completed(chunks, 0);
-
-    size_t submitted = 0;
-    size_t completed_count = 0;
-
-    auto t0 = clk::now();
-
-    while (completed_count < chunks) {
-        // Submit up to queue_depth outstanding (counting submitted - completed_count)
-        while (submitted < chunks && (submitted - completed_count) < static_cast<size_t>(queue_depth)) {
-            // find next not submitted (submitted always grows monotonically here)
-            size_t idx = submitted;
-            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-            if (!sqe) break;
-            size_t offset = idx * io_chunk;
-            // always use full io_chunk length (aligned)
-            size_t len = io_chunk;
-            io_uring_prep_read(sqe, fd, static_cast<char*>(buffer) + offset, len, offset);
-            io_uring_sqe_set_data(sqe, (void*)(uintptr_t)idx);
-            submitted++;
-        }
-
-        // Submit queued SQEs
-        int sret;
-        do {
-            sret = io_uring_submit(&ring);
-            if (sret < 0 && sret != -EAGAIN) {
-                cerr << "io_uring_submit failed: " << strerror(-sret) << "\n";
-                // consider remaining pending as errors
-                size_t remaining = submitted - completed_count;
-                error_count += remaining;
-                auto tnow = clk::now();
-                return chrono::duration<double>(tnow - t0).count();
+        size_t chunks_per_thread = total_chunks / num_threads;
+        size_t start_chunk = tid * chunks_per_thread;
+        size_t end_chunk = (tid == num_threads - 1) ? total_chunks : start_chunk + chunks_per_thread;
+        // if (start_chunk >= end_chunk) return
+        if (start_chunk >= end_chunk) {
+            // No work for this thread
+            // return; no work do smoething else
+            #pragma omp critical
+            {
+                // Just to avoid unused variable warning
+                cerr << "Thread " << tid << ": No chunks assigned.\n";
             }
-        } while (sret < 0 && sret == -EAGAIN);
-
-        // Wait for at least one completion, then drain available completions
-        struct io_uring_cqe* cqe = nullptr;
-        int wait_rc = io_uring_wait_cqe(&ring, &cqe);
-        if (wait_rc < 0) {
-            cerr << "io_uring_wait_cqe failed: " << strerror(-wait_rc) << "\n";
-            error_count += (submitted - completed_count);
-            auto tnow = clk::now();
-            return chrono::duration<double>(tnow - t0).count();
         }
 
-        // Process cqe and any available
-        while (cqe) {
-            uintptr_t idx = (uintptr_t)io_uring_cqe_get_data(cqe);
-            int res = cqe->res;
-            if (res < 0) {
-                int err = -res;
-                // decide retry vs permanent
-                bool should_retry = false;
-                if (err == EAGAIN || err == EINTR) should_retry = true;
-                // Some drivers may return EIO for transient problems; be conservative and retry a couple times?
-                if (err == EIO && retries[idx] < max_retries) should_retry = true;
+        struct io_uring ring;
+        if (io_uring_queue_init(static_cast<unsigned>(queue_depth), &ring, 0) != 0) {
+            cerr << "Thread " << tid << ": io_uring_queue_init failed\n";
+            error_count += (end_chunk - start_chunk);
+            // return;
+            #pragma omp critical
+            {
+                cerr << "Thread " << tid << ": io_uring_queue_init failed\n";
+                error_count += (end_chunk - start_chunk);
+            }
+        }
 
-                if (should_retry && retries[idx] < max_retries) {
-                    retries[idx]++;
-                    // resubmit this chunk immediately (try to keep queue full)
-                    struct io_uring_sqe* nsqe = io_uring_get_sqe(&ring);
-                    if (nsqe) {
-                        size_t offset = idx * io_chunk;
-                        size_t len = io_chunk;
-                        io_uring_prep_read(nsqe, fd, static_cast<char*>(buffer) + offset, len, offset);
-                        io_uring_sqe_set_data(nsqe, (void*)(uintptr_t)idx);
-                        // We don't increase submitted here; this is a retry of already counted chunk.
-                        int rc = io_uring_submit(&ring);
-                        if (rc < 0) {
-                            cerr << "Retry submit failed for chunk " << idx << ": " << strerror(-rc) << "\n";
-                            error_count.fetch_add(1, std::memory_order_relaxed);
-                            completed[idx] = 1;
-                            ++completed_count;
+        vector<int> retries(end_chunk - start_chunk, 0);
+        vector<char> completed(end_chunk - start_chunk, 0);
+        size_t submitted_in_thread = 0;
+        size_t completed_in_thread = 0;
+        size_t chunks_to_read = end_chunk - start_chunk;
+
+        while (completed_in_thread < chunks_to_read) {
+            while (submitted_in_thread < chunks_to_read &&
+                   (submitted_in_thread - completed_in_thread) < static_cast<size_t>(queue_depth)) {
+                size_t chunk_idx_in_thread = submitted_in_thread;
+                size_t chunk_idx_global = start_chunk + chunk_idx_in_thread;
+
+                struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+                if (!sqe) break;
+
+                size_t offset = chunk_idx_global * io_chunk;
+                size_t len = io_chunk;
+                io_uring_prep_read(sqe, fd, static_cast<char*>(buffer) + offset, len, offset);
+                io_uring_sqe_set_data(sqe, (void*)(uintptr_t)chunk_idx_in_thread);
+                submitted_in_thread++;
+            }
+
+            int sret;
+            do {
+                sret = io_uring_submit(&ring);
+            } while (sret < 0 && sret == -EAGAIN);
+
+            if (sret < 0) {
+                cerr << "Thread " << tid << ": io_uring_submit failed: " << strerror(-sret) << "\n";
+                error_count += (submitted_in_thread - completed_in_thread);
+                break;
+            }
+
+            struct io_uring_cqe* cqe = nullptr;
+            int wait_rc = io_uring_wait_cqe(&ring, &cqe);
+            if (wait_rc < 0) {
+                cerr << "Thread " << tid << ": io_uring_wait_cqe failed: " << strerror(-wait_rc) << "\n";
+                error_count += (submitted_in_thread - completed_in_thread);
+                break;
+            }
+
+            while (cqe) {
+                uintptr_t idx_in_thread = (uintptr_t)io_uring_cqe_get_data(cqe);
+                int res = cqe->res;
+
+                if (res < 0) {
+                    int err = -res;
+                    bool should_retry = (err == EAGAIN || err == EINTR || (err == EIO && retries[idx_in_thread] < max_retries));
+
+                    if (should_retry && retries[idx_in_thread] < max_retries) {
+                        retries[idx_in_thread]++;
+                        struct io_uring_sqe* nsqe = io_uring_get_sqe(&ring);
+                        if (nsqe) {
+                            size_t global_idx = start_chunk + idx_in_thread;
+                            size_t offset = global_idx * io_chunk;
+                            size_t len = io_chunk;
+                            io_uring_prep_read(nsqe, fd, static_cast<char*>(buffer) + offset, len, offset);
+                            io_uring_sqe_set_data(nsqe, (void*)(uintptr_t)idx_in_thread);
+                            io_uring_submit(&ring);
                         } else {
-                            // We'll wait for its completion later (do not mark completed yet)
+                            error_count.fetch_add(1, std::memory_order_relaxed);
+                            completed[idx_in_thread] = 1;
+                            completed_in_thread++;
                         }
                     } else {
-                        // couldn't get sqe to retry; mark as error (conservative) and continue
-                        cerr << "Could not allocate SQE to retry chunk " << idx << ", marking failed\n";
                         error_count.fetch_add(1, std::memory_order_relaxed);
-                        completed[idx] = 1;
-                        ++completed_count;
+                        if (!completed[idx_in_thread]) {
+                            completed[idx_in_thread] = 1;
+                            completed_in_thread++;
+                        }
                     }
                 } else {
-                    // Permanent failure for this chunk
-                    cerr << "AIO error (chunk " << idx << "): " << strerror(err) << " (retries=" << retries[idx] << ")\n";
-                    error_count.fetch_add(1, std::memory_order_relaxed);
-                    if (!completed[idx]) {
-                        completed[idx] = 1;
-                        ++completed_count;
+                    if (!completed[idx_in_thread]) {
+                        completed[idx_in_thread] = 1;
+                        completed_in_thread++;
                     }
                 }
-            } else {
-                // Positive result: bytes read (may be < io_chunk for last chunk beyond file end)
-                if (!completed[idx]) {
-                    completed[idx] = 1;
-                    ++completed_count;
+                io_uring_cqe_seen(&ring, cqe);
+                struct io_uring_cqe* next = nullptr;
+                if (io_uring_peek_cqe(&ring, &next) == 0 && next != nullptr) {
+                    cqe = next;
+                } else {
+                    cqe = nullptr;
                 }
             }
-
-            io_uring_cqe_seen(&ring, cqe);
-            // peek for another
-            struct io_uring_cqe* next = nullptr;
-            int peek = io_uring_peek_cqe(&ring, &next);
-            if (peek == 0 && next != nullptr) cqe = next;
-            else cqe = nullptr;
         }
+        io_uring_queue_exit(&ring);
     }
-
-    auto t1 = clk::now();
-    return chrono::duration<double>(t1 - t0).count();
 }
 
 // ---------- printing & utilities ----------
@@ -305,11 +308,12 @@ void print_head(const void* buffer, size_t size) {
     // cout << "---------------------------------\n";
 }
 
-void print_summary(size_t file_size, double read_seconds, uint64_t parsed_numbers, double parse_seconds, bool odirect, size_t io_errors) {
+void print_summary(size_t file_size, double read_seconds, uint64_t parsed_numbers, double parse_seconds, bool odirect, size_t io_errors, int num_threads) {
     double file_mb = double(file_size) / (1024.0 * 1024.0);
     cout << fixed << setprecision(3);
     cout << "\n==== BENCHMARK SUMMARY ====\n";
     cout << "O_DIRECT used: " << (odirect ? "YES" : "NO") << "\n";
+    cout << "Threads used for reading: " << num_threads << "\n";
     cout << "File size: " << file_size << " bytes (" << file_mb << " MB)\n";
     cout << "\n-- READ STAGE --\n";
     cout << "Failed I/O requests: " << io_errors << "\n";
@@ -342,13 +346,11 @@ int main(int argc, char** argv) {
     size_t block_size = (opt.block_size > 0) ? static_cast<size_t>(opt.block_size) : fs_block;
     if (block_size == 0) block_size = 4096;
 
-    // Ensure io_chunk is a multiple of block_size (very important for O_DIRECT)
     size_t requested_chunk = static_cast<size_t>(opt.io_size_kb) * 1024;
     size_t io_chunk = round_up(requested_chunk, block_size);
 
-    // chunks (and alloc_size) use io_chunk as unit
     size_t chunks = (file_size + io_chunk - 1) / io_chunk;
-    size_t alloc_size = chunks * io_chunk; // ensure we can read full aligned chunks
+    size_t alloc_size = chunks * io_chunk;
     cout << "Starting benchmark\n";
     cout << "File: " << opt.filename << " size: " << file_size << " bytes\n";
     cout << "block_size (alignment): " << block_size << "  io_chunk: " << io_chunk
@@ -358,29 +360,28 @@ int main(int argc, char** argv) {
     void* bigbuf = allocate_aligned_buffer(alloc_size, block_size);
     if (!bigbuf) { close(fd); return 1; }
 
-    struct io_uring ring;
-    if (io_uring_queue_init(static_cast<unsigned>(opt.queue_depth), &ring, 0) != 0) {
-        cerr << "io_uring_queue_init failed\n";
-        free(bigbuf); close(fd); return 1;
+    if (opt.user_threads > 0) {
+        omp_set_num_threads(opt.user_threads);
     }
+    int num_threads = omp_get_max_threads();
 
     atomic<size_t> io_errors{0};
-    double read_seconds = submit_and_wait_reads_with_retries(fd, ring, bigbuf, file_size, io_chunk, opt.queue_depth, io_errors, opt.max_retries);
+    auto t0 = clk::now();
+    read_chunk_parallel(fd, bigbuf, file_size, io_chunk, opt.queue_depth, opt.max_retries, io_errors);
+    auto t1 = clk::now();
+    double read_seconds = chrono::duration<double>(t1 - t0).count();
 
-    io_uring_queue_exit(&ring);
 
     if (io_errors.load() > 0) {
         cerr << "\nWARNING: Benchmark completed, but " << io_errors.load() << " I/O errors occurred during the read stage.\n";
         cerr << "The resulting buffer may be incomplete or contain garbage data.\n";
     }
 
-    // parse only up to file_size (not alloc_size)
     auto parse_res = run_parse_stage(bigbuf, file_size, opt.user_threads, opt.delim);
 
-    // print first lines (safe: copy limited)
     size_t head_copy = min(file_size, (size_t)1024);
     print_head(bigbuf, head_copy);
-    print_summary(file_size, read_seconds, parse_res.first, parse_res.second, used_odirect, io_errors.load());
+    print_summary(file_size, read_seconds, parse_res.first, parse_res.second, used_odirect, io_errors.load(), num_threads);
 
     free(bigbuf);
     close(fd);

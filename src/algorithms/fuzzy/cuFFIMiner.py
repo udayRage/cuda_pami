@@ -1,13 +1,5 @@
 """
-cuFFIMiner — CUDA/cuDF Fuzzy Frequent Itemset Miner
-
-What’s new here
----------------
-• Manual “theory” memory trace is recorded (start/gen_peak/mine_peak/steady_post per k).
-• Public getters:
-    - get_theory_memory_bytes(kind="peak"|"static"|"final")
-    - get_theory_memory_report()
-• print_results() now shows Theoretical (manual) Static/Peak next to RMM peak.
+python -m src.algorithms.fuzzy.cuFFIMiner /export/home1/ltarun/cuda_pami/data/fuzzy/Fuzzy_connect/Fuzzy_connect_SF50_fixed.parquet 10000000 -o /export/home1/ltarun/cuda_pami/results/fuzzy/Fuzzy_connect/SF50/patterns_naive_sup100000000.txt --debug 10
 """
 from __future__ import annotations
 
@@ -50,6 +42,9 @@ HashTable = np.dtype(
     align=True,
 )
 
+# 2 itemset struct for candidate generation
+TwoItem = np.dtype([("first", np.uint32), ("second", np.uint32)], align=True)
+
 # -----------------------
 # CUDA kernels
 # -----------------------
@@ -57,18 +52,13 @@ KERNEL_SRC = r"""
 typedef unsigned int uint32_t; typedef unsigned long long uint64_t;
 struct KVPair { uint32_t line; uint64_t probability; };
 struct hash_table { KVPair* table; uint32_t length; uint32_t mask; uint32_t id; KVPair* arr; uint32_t arr_len; };
+struct TwoItem { uint32_t first; uint32_t second; };
 __device__ __forceinline__ uint32_t mul_hash(uint32_t k){ return k * 0x9E3779B1u; }
 __device__ __forceinline__ uint64_t ullmin_dev(uint64_t a, uint64_t b){ return (a < b) ? a : b; }
+
 #define SENTINEL 0u
 
-extern "C" __global__ void number_of_new_candidates_to_generate(const uint32_t *c, uint32_t n, uint32_t k, uint32_t *out){
-    uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; if (i >= n) return;
-    if (k == 1) { out[i+1] = n - i - 1; return; }
-    for (uint32_t j = i + 1; j < n; ++j){
-        bool same = true; for (uint32_t l = 0; l < k - 1; ++l){ if (c[i*k+l] != c[j*k+l]) { same = false; break; } }
-        if (same) atomicAdd(&out[i+1], 1u);
-    }
-}
+
 
 extern "C" __global__ void write_dense_arrays(
     uint64_t total, const uint32_t* __restrict__ items, const uint32_t* __restrict__ lines,
@@ -78,12 +68,138 @@ extern "C" __global__ void write_dense_arrays(
     if (pos < hts[it].arr_len){ hts[it].arr[pos].line = lines[tid]; hts[it].arr[pos].probability = probs[tid]; }
 }
 
-extern "C" __global__ void write_the_new_candidates(const uint32_t *c, uint32_t n, uint32_t k, const uint32_t *idx, uint32_t *out){
-    uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; if (i >= n) return; uint32_t slice = idx[i+1] - idx[i]; if (!slice) return;
-    uint32_t base = idx[i] * (k + 1);
-    for (uint32_t j = 0; j < slice; ++j){ for (uint32_t l = 0; l < k; ++l){ out[base + j*(k+1) + l] = c[i*k+l]; }
-        out[base + j*(k+1) + k] = c[(i+1+j)*k + (k-1)]; }
+
+extern "C" __global__ void number_of_new_candidates_to_generate(const uint32_t *c, uint32_t n, uint32_t k, uint32_t *out, const TwoItem* ht2, const uint32_t num_buckets)
+{
+    uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; if (i >= n) return;
+    if (k == 1) { 
+        out[i+1] = n - i - 1; 
+        return; 
+    }
+
+    uint32_t count = 0;
+    uint32_t original = 0;
+
+    for (uint32_t j = i + 1; j < n; ++j){
+        bool same = true;
+        for (uint32_t l = 0; l < k - 1; ++l){
+            if (c[i*k+l] != c[j*k+l]) 
+            { 
+                same = false; 
+                break; 
+            }
+        }
+        if (!same) break; // early exit
+
+        // original++;
+        // check if the pair (c[i][k-1], c[j][k-1]) exists in ht2
+        uint32_t first = c[i*k + (k-1)];
+        uint32_t second = c[j*k + (k-1)];
+        uint32_t h = mul_hash(first);
+        h ^= mul_hash(second);
+        uint32_t mask = num_buckets - 1;
+        bool found = false;
+        while (true) {
+            uint32_t cur_first = ht2[h].first;
+            uint32_t cur_second = ht2[h].second;
+            if (cur_first == first && cur_second == second) {
+                found = true;
+                break;
+            }
+            if (cur_first == SENTINEL) {
+                break; // not found
+            }
+            h = (h + 1u) & mask;
+        }
+
+        if (found)
+            ++count;
+    }
+
+    out[i+1] = count;
 }
+
+
+
+
+extern "C" __global__ void write_the_new_candidates(const uint32_t *c, uint32_t n, uint32_t k, const uint32_t *idx, uint32_t *out, const TwoItem* ht2, const uint32_t num_buckets)
+{
+    uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; 
+    if (i >= n) return;
+    uint32_t slice = idx[i+1] - idx[i]; 
+
+    if (!slice) return; // early exit
+
+    uint32_t base = idx[i] * (k + 1);
+
+    uint32_t found_count = 0;
+
+
+    if (k == 1)
+    {
+        for (uint32_t j = 0; j < slice; ++j) 
+        {
+            for (uint32_t l = 0; l < k; ++l)
+            { 
+                out[base + j*(k+1) + l] = c[i*k+l]; 
+            }
+            out[base + j*(k+1) + k] = c[(i+1+j)*k + (k-1)]; 
+        }
+        return;
+    }
+    else 
+    {
+        for (uint32_t j = i + 1; j < n; ++j){ // from candidate i, compare with all (n) other candidates after `j` 
+            bool same = true; 
+            for (uint32_t l = 0; l < k - 1; ++l) // compare first k-1 items
+            { 
+                // if the prefix of length k-1 matches
+                if (c[i*k+l] != c[j*k+l]) 
+                { 
+                    same = false; 
+                    break; 
+                }
+            }
+
+            if (!same) break; // early exit
+
+            // check if the pair (c[i][k-1], c[j][k-1]) exists in ht2
+            uint32_t first = c[i*k + (k-1)];
+            uint32_t second = c[j*k + (k-1)];
+
+            uint32_t h = mul_hash(first);
+            h ^= mul_hash(second);
+            uint32_t mask = num_buckets - 1;
+            bool found = false;
+            while (true) {
+                uint32_t cur_first = ht2[h].first;
+                if (cur_first == first) {
+                    if (ht2[h].second == second) {
+                        found = true;
+                    }
+                    break;
+                }
+                if (cur_first == SENTINEL) {
+                    break;
+                }
+                h = (h + 1u) & mask;
+            }
+            
+
+            if (!found) continue;
+
+            for (uint32_t l = 0; l < k; ++l)
+            { 
+                out[base + found_count*(k+1) + l] = c[i*k+l]; 
+            }
+            out[base + found_count*(k+1) + k] = c[j*k + (k-1)];
+
+            found_count++;
+
+        }
+    }
+}
+
 
 __device__ __forceinline__ void ht_insert(hash_table &ht, uint32_t key, uint64_t val){
     uint32_t h = mul_hash(key) & ht.mask; while (true){
@@ -106,6 +222,32 @@ extern "C" __global__ void mine_kernel(const hash_table* __restrict__ hts, const
         for (uint32_t j = 0; j < reqHits; ++j){ uint64_t p = ht_get(hts[cands[bid*candSize + j]], line); if (p == 0){ hits = 0u; break; } min_p = ullmin_dev(min_p, p); ++hits; }
         if (hits == reqHits){ local_support += min_p; } }
     if (local_support != 0){ atomicAdd(&supports[bid], local_support); } }
+
+
+extern "C" __global__ void build_ht2(const uint32_t n, const uint32_t (*cands)[2], struct TwoItem* ht2, uint32_t num_buckets)
+{
+    uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; if (i >= n) return;
+    uint32_t first = cands[i][0];
+    uint32_t second = cands[i][1];
+
+    // simple multiplicative hash
+    uint32_t h = mul_hash(first);
+    h ^= mul_hash(second);
+
+    // linear probing
+    uint32_t mask = num_buckets - 1;
+    while (true) {
+        uint32_t old_first = atomicCAS(&ht2[h].first, SENTINEL, first);
+        if (old_first == SENTINEL || old_first == first) {
+            // either inserted new or found existing 'first'
+            atomicExch(&ht2[h].second, second);
+            break;
+        }
+        h = (h + 1u) & mask;
+    }
+
+}   
+
 """
 
 # -----------------------
@@ -159,7 +301,9 @@ def _compile_kernels():
         mod.get_function("build_tables"),
         mod.get_function("mine_kernel"),
         mod.get_function("write_dense_arrays"),
+        mod.get_function("build_ht2"),
     )
+
 
 
 # -----------------------
@@ -209,7 +353,7 @@ class cuFFIMiner(BaseAlgorithm):
         self._theory_static_map: Dict[str, int] = {}
         self._theory_trace: List[Dict[str, Any]] = []
 
-        self._kern_num, self._kern_write, self._kern_build, self._kern_mine, self._kern_write_dense = _compile_kernels()
+        self._kern_num, self._kern_write, self._kern_build, self._kern_mine, self._kern_write_dense, self._kern_build_ht2 = _compile_kernels()
         self._init_nvml()
 
     # -------- Manual memory helpers --------
@@ -499,20 +643,21 @@ class cuFFIMiner(BaseAlgorithm):
     # -------------------
     # Candidate gen & mining (manual accounting)
     # -------------------
-    def _generate_next_candidates(self, cands: cp.ndarray, k: int):
+    def _generate_next_candidates(self, cands: cp.ndarray, k: int, ht2: Optional[cp.ndarray] = None) -> Tuple[cp.ndarray, int]:
         """Generate (k+1)-item candidates and return (array, temp_bytes_during_generation)."""
         n = len(cands)
         if n == 0:
             return cp.array([], dtype=cp.uint32), 0
         grid = (n + self._max_threads - 1) // self._max_threads
         num = cp.zeros(n + 1, dtype=cp.uint32)                 # temp
-        self._kern_num((grid,), (self._max_threads,), (cands, n, k, num))
+        self._kern_num((grid,), (self._max_threads,), (cands, n, k, num, ht2, 0 if ht2 is None else len(ht2)))
         idx = cp.cumsum(num, dtype=cp.uint32)                  # temp
         out_len = int(idx[-1].get())
         if out_len == 0:
             return cp.array([], dtype=cp.uint32), int(num.nbytes + idx.nbytes)
         nxt = cp.zeros((out_len, k + 1), dtype=cp.uint32)      # temp
-        self._kern_write((grid,), (self._max_threads,), (cands, n, k, idx, nxt))
+        # self._kern_write((grid,), (self._max_threads,), (cands, n, k, idx, nxt))
+        self._kern_write((grid,), (self._max_threads,), (cands, n, k, idx, nxt, ht2, 0 if ht2 is None else len(ht2)))
         gen_tmp_bytes = int(num.nbytes + idx.nbytes + nxt.nbytes)
         return nxt, gen_tmp_bytes
 
@@ -548,10 +693,14 @@ class cuFFIMiner(BaseAlgorithm):
         k = 1
         candidates = self.support_df["new_id"].to_cupy().reshape(-1, 1)
         gpu_results = []
+
+        ht2 = None  # for k=2 lookups
+
         while len(candidates) > 0:
+            print(f"--- k={k} candidates: {len(candidates)} ---")
             self._record_manual_report(f"k={k}/start", static_map=static_map, candidates=candidates)
 
-            next_candidates, gen_tmp_bytes = self._generate_next_candidates(candidates, k)
+            next_candidates, gen_tmp_bytes = self._generate_next_candidates(candidates, k, ht2)
             self._record_manual_report(
                 f"k={k}/gen", static_map=static_map, candidates=candidates,
                 gen_tmp_bytes=gen_tmp_bytes, next_candidates=next_candidates
@@ -577,6 +726,28 @@ class cuFFIMiner(BaseAlgorithm):
                 gpu_results.append((frequent.get(), supports[mask].get()))
 
             self._record_manual_report(f"k={k}/post", static_map=static_map, frequent=frequent)
+
+            if k == 2:
+                # # print the freqeutn
+                # for i in range(len(frequent)):
+                #     ids_cpu = frequent[i].get()
+                #     # reshape so that we have (N,2)
+                #     print(f"frequent[{i}]: {ids_cpu}")
+
+                # make hash set for fast 2-item lookups 
+                num_buckets = int(2 ** np.ceil(np.log2(len(frequent) * INV_LOAD_FACTOR)))
+                ht2 = cp.zeros(num_buckets, dtype=TwoItem)
+                self._kern_build_ht2(((len(frequent) + self._max_threads - 1) // self._max_threads,), (self._max_threads,), (len(frequent), frequent, ht2, num_buckets))
+                cp.cuda.runtime.deviceSynchronize()
+                # print ht2
+
+                # sent_slot = np.array([(0, 0)], dtype=TwoItem)[0]
+                # print(f"sentinel slot: {sent_slot}")
+
+                # for i in range(len(ht2)):
+                #     get = ht2[i].get()
+                #     if get != sent_slot:
+                #         print(f"ht2[{i}]: {get}")
 
             del supports, mask, next_candidates
             gc.collect()
@@ -618,7 +789,7 @@ class cuFFIMiner(BaseAlgorithm):
 
     def save(self, oFile: Union[str, Path]) -> None:
         """Write mined itemsets and supports to a TSV file."""
-        with open(oFile, "w") as f:
+        with open(oFile, "w+") as f:
             for itemset, support in self.patterns.items():
                 f.write(f"{','.join(itemset)}\t{support}\n")
 

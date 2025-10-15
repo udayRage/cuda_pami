@@ -1,7 +1,8 @@
-// gds_bench_csr.cpp
-// Refactored: functions, single big GDS transfer, print_head/print_summary integrated.
-// Compile with: nvcc -std=c++17 -O3 -arch=native -Xcompiler "-fopenmp" \
-//   -o gds_bench_csr gds_bench_csr.cpp -lcufile -lboost_program_options -lnvToolsExt
+// gds_bench_fixed_parse.cu
+// GDS read with multi-stage GPU parallel parse.
+// Compile with:
+// nvcc -std=c++17 -O3 -arch=native -Xcompiler "-fopenmp" -o gds_bench gds_bench_fixed_parse.cu -lcufile -lboost_program_options
+//
 
 #include <iostream>
 #include <string>
@@ -12,9 +13,6 @@
 #include <cstdint>
 #include <cerrno>
 #include <iomanip>
-#include <memory>
-#include <numeric>
-#include <atomic>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -23,7 +21,10 @@
 
 #include <cuda_runtime.h>
 #include <cufile.h>
-#include <nvtx3/nvToolsExt.h>
+#include <thrust/device_ptr.h>
+#include <thrust/scan.h>
+#include <thrust/sort.h>
+#include <thrust/execution_policy.h>
 
 #include <boost/program_options.hpp>
 
@@ -35,28 +36,29 @@ using clk = chrono::high_resolution_clock;
 // Error checking macros
 // -----------------------------
 #define CUDA_CHECK(call)                                                   \
-    do                                                                     \
-    {                                                                      \
-        cudaError_t err = call;                                            \
-        if (err != cudaSuccess)                                            \
-        {                                                                  \
-            cerr << "CUDA Error in " << #call << " at " << __FILE__ << ":" \
-                 << __LINE__ << ": " << cudaGetErrorString(err) << endl;   \
-            exit(EXIT_FAILURE);                                            \
-        }                                                                  \
+    do                                                                      \
+    {                                                                       \
+        cudaError_t err = call;                                             \
+        if (err != cudaSuccess)                                             \
+        {                                                                   \
+            std::cerr << "CUDA Error: " << #call << " at " << __FILE__      \
+                      << ":" << __LINE__ << " : " << cudaGetErrorString(err) << std::endl; \
+            exit(EXIT_FAILURE);                                             \
+        }                                                                   \
     } while (0)
 
-#define GDS_CHECK(call)                                                         \
-    do                                                                          \
-    {                                                                           \
-        CUfileError_t err = call;                                               \
-        if (err.err != CU_FILE_SUCCESS)                                         \
-        {                                                                       \
-            cerr << "GDS Error in " << #call << " at " << __FILE__ << ":"       \
-                 << __LINE__ << ": " << cufileop_status_error(err.err) << endl; \
-            exit(EXIT_FAILURE);                                                 \
-        }                                                                       \
+#define GDS_CHECK(call)                                                     \
+    do                                                                       \
+    {                                                                        \
+        CUfileError_t _gds_err = call;                                      \
+        if (_gds_err.err != CU_FILE_SUCCESS)                                \
+        {                                                                    \
+            std::cerr << "GDS Error: " << #call << " at " << __FILE__       \
+                      << ":" << __LINE__ << " : " << cufileop_status_error(_gds_err.err) << std::endl; \
+            exit(EXIT_FAILURE);                                              \
+        }                                                                    \
     } while (0)
+
 
 // -----------------------------
 // Utilities
@@ -69,92 +71,142 @@ static inline size_t round_up(size_t x, size_t a)
 struct Options
 {
     string filename;
-    int io_size_kb = 1024;
-    int block_size_kb = 128; // CUDA kernel processing block size (unused for read)
     char delim = ',';
     bool odirect = true;
 };
 
-// -----------------------------
-// CUDA Kernels (unchanged logic)
-// -----------------------------
-__global__ void parse_and_count_lines_kernel(const char *data, size_t data_size, char delim,
-                                             uint64_t *total_numbers_gpu, uint64_t *line_counts_gpu,
-                                             size_t max_lines)
+// Custom struct to hold all results from the parse stage
+struct ParseResult
 {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = gridDim.x * blockDim.x;
-    size_t current_line = 0;
+    unsigned int *d_final_data = nullptr; // Device pointer to the final parsed integer data
+    uint64_t total_lines = 0;
+    uint64_t total_items = 0;
+    double parse_seconds = 0.0;
+};
 
-    __shared__ size_t line_count_shared;
-    __shared__ size_t total_numbers_shared;
-    if (threadIdx.x == 0){
-        line_count_shared = 0;
-        total_numbers_shared = 0;
+
+// -----------------------------
+// CUDA Kernels for multi-stage parsing
+// -----------------------------
+
+// Kernel 1: Count the number of newline characters
+__global__ void num_new_lines_kernel(const char *data, size_t size, unsigned int *numLines)
+{
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= size) return;
+    if (data[tid] == '\n') {
+        atomicAdd(&numLines[0], 1);
     }
-    __syncthreads();
+}
 
-    for (size_t i = idx; i < data_size; i += stride)
+// Kernel 2: Find the indices of all newline characters
+__global__ void find_new_lines_kernel(const char *data, size_t size, unsigned long long *newline_indices)
+{
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= size) return;
+    if (data[tid] == '\n')
     {
-        if (i > 0 && data[i - 1] == '\n')
+        unsigned long long index = atomicAdd(&newline_indices[0], 1);
+        newline_indices[index + 1] = tid;
+    }
+}
+
+// Kernel 3: Count the number of items per line
+__global__ void get_items_per_line_kernel(const char *data, const unsigned long long *indexes, size_t numLines, int *items_per_line, char delimiter)
+{
+    size_t lineIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lineIdx >= numLines) return;
+
+    size_t start = (lineIdx == 0) ? 0 : indexes[lineIdx] + 1;
+    size_t end = indexes[lineIdx + 1];
+
+    int local_items = 1; // Start with 1 item
+    for (size_t i = start; i < end; i++)
+    {
+        if (data[i] == delimiter)
         {
-            current_line++;
+            local_items++;
         }
+    }
+    items_per_line[lineIdx] = local_items;
+}
 
-        bool is_start_of_num = (data[i] >= '0' && data[i] <= '9') &&
-                               (i == 0 || data[i - 1] == delim || data[i - 1] == '\n');
 
-        if (is_start_of_num)
+// Device-side atoi for the final conversion kernel
+__device__ int my_atoi(const char *str, int len)
+{
+    int result = 0;
+    int sign = 1;
+    int i = 0;
+
+    // Skip leading spaces
+    while (i < len && str[i] == ' ') {
+        i++;
+    }
+
+    // Handle sign
+    if (i < len && str[i] == '-') {
+        sign = -1;
+        i++;
+    } else if (i < len && str[i] == '+') {
+        i++;
+    }
+
+    // Convert digits
+    while (i < len && str[i] >= '0' && str[i] <= '9') {
+        result = result * 10 + (str[i] - '0');
+        i++;
+    }
+
+    return sign * result;
+}
+
+
+// Kernel 4: Convert character data to integers
+__global__ void convert_char_to_int_kernel(const char *data, const unsigned long long *line_start_indices, const unsigned long long *item_offsets, size_t numLines, unsigned int *rawData, char separator)
+{
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= numLines) return;
+
+    size_t line_start = (tid == 0) ? 0 : line_start_indices[tid] + 1;
+    size_t line_end = line_start_indices[tid + 1];
+
+    char buffer[32]; // Max length for a 32-bit integer string
+    int bufferIndex = 0;
+    unsigned long long write_idx = item_offsets[tid];
+
+    for (size_t k = line_start; k <= line_end; k++)
+    {
+        if (k == line_end || data[k] == separator)
         {
-            // atomicAdd(reinterpret_cast<unsigned long long *>(total_numbers_gpu), 1ULL);
-            atomicAdd(reinterpret_cast<unsigned long long *>(&total_numbers_shared), 1ULL);
-            if (current_line < max_lines)
+            if (bufferIndex > 0)
             {
-                // atomicAdd(reinterpret_cast<unsigned long long *>(&line_counts_gpu[current_line]), 1ULL);
-                atomicAdd(reinterpret_cast<unsigned long long *>(&line_count_shared), 1ULL);
+                rawData[write_idx++] = my_atoi(buffer, bufferIndex);
+                bufferIndex = 0;
+            }
+        }
+        else
+        {
+            if (bufferIndex < sizeof(buffer))
+            {
+                buffer[bufferIndex++] = data[k];
             }
         }
     }
-
-    __syncthreads();
-
-    if (threadIdx.x == 0){
-        atomicAdd(reinterpret_cast<unsigned long long *>(total_numbers_gpu), static_cast<unsigned long long>(total_numbers_shared));
-        if (current_line < max_lines){
-            atomicAdd(reinterpret_cast<unsigned long long *>(&line_counts_gpu[current_line]), static_cast<unsigned long long>(line_count_shared));
-        }
-    }
 }
 
-__global__ void prefix_sum_to_csr_kernel(const uint64_t *line_counts, uint64_t *row_ptrs, size_t num_lines)
-{
-    // Simple single-threaded kernel: run on 1 block/1 thread
-    if (threadIdx.x == 0 && blockIdx.x == 0)
-    {
-        row_ptrs[0] = 0;
-        uint64_t current_sum = 0;
-        for (size_t i = 0; i < num_lines; ++i)
-        {
-            current_sum += line_counts[i];
-            row_ptrs[i + 1] = current_sum;
-        }
-    }
-}
 
 // -----------------------------
 // Forward declarations
 // -----------------------------
 bool parse_cli(int argc, char **argv, Options &opt);
-size_t get_line_count(const string &filename);
 int open_file(const string &filename, bool odirect);
 bool get_file_info(int fd, size_t &file_size, size_t &fs_block);
-void *allocate_aligned_host_buffer(size_t size, size_t alignment);
 bool init_gds_driver();
-bool register_buffer_with_gds(void *buf, size_t size);
 ssize_t single_big_gds_read(CUfileHandle_t cf_handle, char *d_buffer, size_t file_size);
 void print_head(const void *buffer, size_t size);
-void print_summary(size_t file_size, double read_seconds, uint64_t parsed_numbers, double parse_seconds, bool odirect, size_t io_errors);
-pair<uint64_t, double> run_parse_stage(char *d_buffer, size_t file_size, size_t num_lines, char delim);
+void print_summary(size_t file_size, double read_seconds, const ParseResult& result, bool odirect);
+ParseResult run_parse_stage(char *d_buffer, size_t file_size, char delim);
 
 // -----------------------------
 // Implementations
@@ -162,7 +214,7 @@ pair<uint64_t, double> run_parse_stage(char *d_buffer, size_t file_size, size_t 
 bool parse_cli(int argc, char **argv, Options &opt)
 {
     po::options_description desc("Allowed options");
-    desc.add_options()("help,h", "show help")("file", po::value<string>()->required(), "input file (positional)")("io-size-kb,i", po::value<int>()->default_value(1024), "GDS IO size per request (KB)")("delim,d", po::value<char>()->default_value(','), "delimiter for parse stage")("no-odirect", "disable O_DIRECT");
+    desc.add_options()("help,h", "show help")("file", po::value<string>()->required(), "input file (positional)")("delim,d", po::value<char>()->default_value(','), "delimiter for parse stage")("no-odirect", "disable O_DIRECT");
 
     po::positional_options_description p;
     p.add("file", 1);
@@ -172,7 +224,7 @@ bool parse_cli(int argc, char **argv, Options &opt)
         po::store(po::command_line_parser(argc, argv).options(desc).positional(p).run(), vm);
         if (vm.count("help"))
         {
-            cout << "gds_bench_csr - GDS read + CUDA parse benchmark\n\n";
+            cout << "gds_bench - GDS read + CUDA multi-stage parse benchmark\n\n";
             cout << "Usage: " << argv[0] << " <file> [options]\n\n"
                  << desc << "\n";
             return false;
@@ -186,38 +238,11 @@ bool parse_cli(int argc, char **argv, Options &opt)
         return false;
     }
     opt.filename = vm["file"].as<string>();
-    opt.io_size_kb = vm["io-size-kb"].as<int>();
     opt.delim = vm["delim"].as<char>();
     opt.odirect = (vm.count("no-odirect") == 0);
     return true;
 }
 
-size_t get_line_count(const string &filename)
-{
-    FILE *f = fopen(filename.c_str(), "r");
-    if (!f)
-        return 0;
-    size_t count = 0;
-    const size_t BUF_SZ = 64 * 1024;
-    vector<char> buf(BUF_SZ);
-    while (!feof(f))
-    {
-        size_t bytes_read = fread(buf.data(), 1, buf.size(), f);
-        for (size_t i = 0; i < bytes_read; ++i)
-        {
-            if (buf[i] == '\n')
-                count++;
-        }
-        if (bytes_read == 0)
-            break;
-    }
-    fclose(f);
-    // Add one for the last line if the file doesn't end with a newline
-    struct stat st;
-    if (stat(filename.c_str(), &st) == 0 && st.st_size > 0)
-        count++;
-    return count;
-}
 
 int open_file(const string &filename, bool odirect)
 {
@@ -237,19 +262,8 @@ bool get_file_info(int fd, size_t &file_size, size_t &fs_block)
         return false;
     }
     file_size = static_cast<size_t>(st.st_size);
-
-    // try to obtain filesystem block size / IO alignment
     fs_block = static_cast<size_t>(st.st_blksize ? st.st_blksize : 4096);
     return true;
-}
-
-void *allocate_aligned_host_buffer(size_t size, size_t alignment)
-{
-    void *ptr = nullptr;
-    if (posix_memalign(&ptr, alignment, size) != 0)
-        return nullptr;
-    memset(ptr, 0, size);
-    return ptr;
 }
 
 bool init_gds_driver()
@@ -263,34 +277,16 @@ bool init_gds_driver()
     return true;
 }
 
-bool register_buffer_with_gds(void *buf, size_t size)
-{
-    CUfileError_t e = cuFileBufRegister(buf, size, 0);
-    if (e.err != CU_FILE_SUCCESS)
-    {
-        cerr << "cuFileBufRegister failed: " << cufileop_status_error(e.err) << endl;
-        return false;
-    }
-    return true;
-}
 
-/**
- * Attempt to read the entire file with a single cuFileRead call.
- * If cuFileRead returns a partial read, fall back to reading remaining bytes in a loop.
- * Returns total bytes read or negative on fatal error.
- */
 ssize_t single_big_gds_read(CUfileHandle_t cf_handle, char *d_buffer, size_t file_size)
 {
     ssize_t total_read = 0;
     ssize_t ret = cuFileRead(cf_handle, d_buffer, file_size, 0, 0);
     if (ret < 0)
     {
-        // fatal read error
         return ret;
     }
     total_read += ret;
-
-    // If partial, continue reading remaining bytes (should be rare with GDS single large read).
     while (static_cast<size_t>(total_read) < file_size)
     {
         ssize_t rem = static_cast<ssize_t>(file_size - static_cast<size_t>(total_read));
@@ -304,20 +300,13 @@ ssize_t single_big_gds_read(CUfileHandle_t cf_handle, char *d_buffer, size_t fil
     return total_read;
 }
 
-/**
- * @brief Prints the first two lines of a buffer for verification.
- * @param buffer Pointer to the data.
- * @param size The total size of the data.
- */
 void print_head(const void *buffer, size_t size)
 {
     const char *data = static_cast<const char *>(buffer);
     size_t current_pos = 0;
     int newlines_found = 0;
-    size_t print_limit = std::min(size, (size_t)1024); // Cap max output to prevent huge dumps
-
+    size_t print_limit = std::min(size, (size_t)1024);
     cout << "\n--- FILE HEAD (first 2 lines) ---\n";
-
     while (current_pos < print_limit && newlines_found < 2)
     {
         cout.put(data[current_pos]);
@@ -327,61 +316,29 @@ void print_head(const void *buffer, size_t size)
         }
         current_pos++;
     }
-
-    if (current_pos < size && newlines_found < 2) // If we hit print_limit before 2 newlines
+     if (current_pos < size)
     {
         cout << "[...]\n";
     }
-    else if (current_pos < size) // If we have more content beyond 2 newlines
-    {
-        if (current_pos > 0 && data[current_pos - 1] != '\n')
-        {
-            cout << "\n";
-        }
-        cout << "[...]\n";
-    }
-    cout << "[...]\n";
-
+    cout << "---------------------------------\n";
 }
 
-/**
- * @brief Prints a final summary of the benchmark results.
- * @param file_size Total size of the file.
- * @param read_seconds Time taken for the read stage.
- * @param parsed_numbers Total numbers counted in the parse stage.
- * @param parse_seconds Time taken for the parse stage.
- * @param odirect Whether O_DIRECT was used.
- * @param io_errors The number of failed I/O requests.
- */
-void print_summary(size_t file_size, double read_seconds, uint64_t parsed_numbers, double parse_seconds, bool odirect, size_t io_errors)
+void print_summary(size_t file_size, double read_seconds, const ParseResult& result, bool odirect)
 {
     double file_mb = double(file_size) / (1024.0 * 1024.0);
     cout << fixed << setprecision(3);
-    cout << "\n==== BENCHMARK SUMMARY ====\n";
+    cout << "\n==== BENCHMARK SUMMARY ====" << "\n";
     cout << "O_DIRECT used: " << (odirect ? "YES" : "NO") << "\n";
-    cout << "File size: " << file_size << " bytes (" << file_mb << " MB)\n";
+    cout << "File size: " << file_size << " bytes (" << file_mb << " MB)" << "\n";
     cout << "\n-- READ STAGE --\n";
-    cout << "Failed I/O requests: " << io_errors << "\n";
     cout << "Elapsed read time: " << read_seconds << " s\n";
-    if (io_errors == 0)
-    {
-        cout << "Read throughput: " << (file_mb / max(read_seconds, 1e-12)) << " MB/s\n";
-    }
-    else
-    {
-        cout << "Read throughput: N/A (due to I/O errors)\n";
-    }
+    cout << "Read throughput: " << (file_mb / max(read_seconds, 1e-12)) << " MB/s\n";
+    
     cout << "\n-- PARSE STAGE --\n";
-    cout << "Parsed numeric tokens: " << parsed_numbers << "\n";
-    cout << "Parse elapsed: " << parse_seconds << " s\n";
-    if (io_errors == 0)
-    {
-        cout << "Parse throughput (fileMB/parse_time): " << (file_mb / max(parse_seconds, 1e-12)) << " MB/s\n";
-    }
-    else
-    {
-        cout << "Parse throughput: N/A (due to I/O errors and potentially corrupt data)\n";
-    }
+    cout << "Parsed lines: " << result.total_lines << "\n";
+    cout << "Parsed numeric items: " << result.total_items << "\n";
+    cout << "Parse elapsed: " << result.parse_seconds << " s\n";
+    cout << "Parse throughput (fileMB/parse_time): " << (file_mb / max(result.parse_seconds, 1e-12)) << " MB/s\n";
 
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
@@ -389,62 +346,100 @@ void print_summary(size_t file_size, double read_seconds, uint64_t parsed_number
     cout << "===========================\n";
 }
 
-/**
- * Run the CUDA parse kernels: counting numeric tokens and generating CSR row_ptrs.
- * Returns pair<total_numbers, parse_time_seconds>.
- */
-pair<uint64_t, double> run_parse_stage(char *d_buffer, size_t file_size, size_t num_lines, char delim)
+
+ParseResult run_parse_stage(char *d_buffer, size_t file_size, char delim)
 {
-    nvtxRangePushA("CUDA Parse");
     auto t0_parse = clk::now();
 
-    // Allocate GPU memory for counters
-    uint64_t *d_total_numbers = nullptr;
-    uint64_t *d_line_counts = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_total_numbers, sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_line_counts, sizeof(uint64_t) * max((size_t)1, num_lines)));
-    CUDA_CHECK(cudaMemset(d_total_numbers, 0, sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemset(d_line_counts, 0, sizeof(uint64_t) * max((size_t)1, num_lines)));
-
-    // Kernel launch configuration
-    int blockSize = 1024; // threads per block
-    // choose gridSize based on file_size bytes to give enough parallelism
+    // Configure kernel launch parameters
+    int blockSize = 256;
     int gridSize = static_cast<int>((file_size + blockSize - 1) / blockSize);
-    // cap grid size to a reasonable number to avoid oversubscription
-    if (gridSize < 1) gridSize = 1;
-    if (gridSize > 65535) gridSize = 65535;
 
-    parse_and_count_lines_kernel<<<gridSize, blockSize>>>(d_buffer, file_size, delim,
-                                                          d_total_numbers, d_line_counts, num_lines);
+    // --- STAGE 1: Count new lines ---
+    unsigned int *d_num_lines;
+    CUDA_CHECK(cudaMalloc(&d_num_lines, sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(d_num_lines, 0, sizeof(unsigned int)));
+    num_new_lines_kernel<<<gridSize, blockSize>>>(d_buffer, file_size, d_num_lines);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    unsigned int h_num_lines = 0;
+    CUDA_CHECK(cudaMemcpy(&h_num_lines, d_num_lines, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    // Assuming file ends with a newline, otherwise logic to add 1 might be needed.
+    size_t total_lines = h_num_lines;
+    cout << "Parse Stage: Found " << total_lines << " lines.\n";
 
-    auto t1_parse_kernels = clk::now();
+    if (total_lines == 0) {
+        // Handle empty or single-line file
+        CUDA_CHECK(cudaFree(d_num_lines));
+        return {nullptr, 0, 0, 0.0};
+    }
 
-    // CSR generation
-    nvtxRangePushA("CSR Generation");
-    uint64_t *d_row_ptrs = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_row_ptrs, sizeof(uint64_t) * (max((size_t)1, num_lines) + 1)));
-    prefix_sum_to_csr_kernel<<<1, 1>>>(d_line_counts, d_row_ptrs, num_lines);
+    // --- STAGE 2: Find newline indices ---
+    unsigned long long *d_newline_indices;
+    CUDA_CHECK(cudaMalloc(&d_newline_indices, (total_lines + 1) * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d_newline_indices, 0, (total_lines + 1) * sizeof(unsigned long long)));
+    find_new_lines_kernel<<<gridSize, blockSize>>>(d_buffer, file_size, d_newline_indices);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    nvtxRangePop(); // CSR Generation
+    // We need to sort the indices found atomically. A simple device-side sort will do.
+    thrust::sort(thrust::device_pointer_cast(d_newline_indices + 1), thrust::device_pointer_cast(d_newline_indices + 1 + total_lines));
 
+
+    // --- STAGE 3: Get items per line ---
+    int *d_items_per_line;
+    CUDA_CHECK(cudaMalloc(&d_items_per_line, total_lines * sizeof(int)));
+    int itemsGridSize = (total_lines + blockSize - 1) / blockSize;
+    get_items_per_line_kernel<<<itemsGridSize, blockSize>>>(d_buffer, d_newline_indices, total_lines, d_items_per_line, delim);
+    CUDA_CHECK(cudaGetLastError());
+
+    // --- STAGE 4: Prefix Sum to get offsets and total items ---
+    unsigned long long *d_item_offsets;
+    CUDA_CHECK(cudaMalloc(&d_item_offsets, (total_lines + 1) * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d_item_offsets, 0, (total_lines + 1) * sizeof(unsigned long long)));
+
+    // Using Thrust for exclusive scan to get starting positions for each line's items
+    thrust::exclusive_scan(thrust::device_pointer_cast(d_items_per_line),
+                           thrust::device_pointer_cast(d_items_per_line + total_lines),
+                           thrust::device_pointer_cast(d_item_offsets));
+    
+    // Get the total number of items from the last element of the offsets + last line's item count
+    uint64_t total_items;
+    int last_line_items;
+    CUDA_CHECK(cudaMemcpy(&last_line_items, d_items_per_line + total_lines - 1, sizeof(int), cudaMemcpyDeviceToHost));
+    unsigned long long last_offset;
+    CUDA_CHECK(cudaMemcpy(&last_offset, d_item_offsets + total_lines-1, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    total_items = last_offset + last_line_items;
+
+    cout << "Parse Stage: Found " << total_items << " total numeric items.\n";
+    
+
+    // --- STAGE 5: Allocate final buffer and convert ---
+    unsigned int *d_final_data;
+    CUDA_CHECK(cudaMalloc(&d_final_data, total_items * sizeof(unsigned int)));
+
+    convert_char_to_int_kernel<<<itemsGridSize, blockSize>>>(d_buffer, d_newline_indices, d_item_offsets, total_lines, d_final_data, delim);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaDeviceSynchronize());
     auto t1_parse = clk::now();
     double parse_seconds = chrono::duration<double>(t1_parse - t0_parse).count();
+    
+    // Free intermediate buffers
+    CUDA_CHECK(cudaFree(d_num_lines));
+    CUDA_CHECK(cudaFree(d_newline_indices));
+    CUDA_CHECK(cudaFree(d_items_per_line));
+    CUDA_CHECK(cudaFree(d_item_offsets));
 
-    // Copy totals back
-    uint64_t total_numbers_h = 0;
-    CUDA_CHECK(cudaMemcpy(&total_numbers_h, d_total_numbers, sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    cerr << "[timing] parse total: " << parse_seconds << " s\n";
 
-    // cleanup GPU allocations used in parse
-    CUDA_CHECK(cudaFree(d_total_numbers));
-    CUDA_CHECK(cudaFree(d_line_counts));
-    CUDA_CHECK(cudaFree(d_row_ptrs));
+    ParseResult result;
+    result.d_final_data = d_final_data;
+    result.total_lines = total_lines;
+    result.total_items = total_items;
+    result.parse_seconds = parse_seconds;
 
-    nvtxRangePop(); // CUDA Parse
-    return {total_numbers_h, parse_seconds};
+    return result;
 }
+
 
 // -----------------------------
 // Main
@@ -455,9 +450,6 @@ int main(int argc, char **argv)
     if (!parse_cli(argc, argv, opt))
         return 1;
 
-    nvtxRangePushA("Setup");
-
-    // Open file
     int fd = open_file(opt.filename, opt.odirect);
     if (fd < 0)
     {
@@ -479,25 +471,20 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    size_t io_chunk = static_cast<size_t>(opt.io_size_kb) * 1024;
-    // for registration and O_DIRECT alignment, align to filesystem block size
-    size_t alloc_size = round_up(file_size, fs_block);
-    size_t registration_size = round_up(alloc_size, io_chunk);
+    // GDS requires allocations to be aligned to FS block size for O_DIRECT
+    size_t registration_size = round_up(file_size, fs_block);
 
     cout << "Starting GDS benchmark\n";
     cout << "File: " << opt.filename << " size: " << file_size << " bytes\n";
-    cout << "Requested IO chunk size: " << opt.io_size_kb << " KB\n";
     cout << "Alignment / FS block: " << fs_block << " bytes\n";
     cout << "Alloc/register size (rounded): " << registration_size << " bytes\n";
 
-    // Initialize GDS
     if (!init_gds_driver())
     {
         close(fd);
         return 1;
     }
 
-    // Prepare cuFile descriptor & register handle
     CUfileDescr_t cf_desc;
     memset(&cf_desc, 0, sizeof(CUfileDescr_t));
     cf_desc.handle.fd = fd;
@@ -505,17 +492,11 @@ int main(int argc, char **argv)
     CUfileHandle_t cf_handle;
     GDS_CHECK(cuFileHandleRegister(&cf_handle, &cf_desc));
 
-    // Allocate device buffer and register with GDS
     char *d_buffer = nullptr;
     CUDA_CHECK(cudaMalloc(&d_buffer, registration_size));
     GDS_CHECK(cuFileBufRegister(d_buffer, registration_size, 0));
 
-    nvtxRangePop(); // Setup
-
-    // Perform single big GDS read
-    nvtxRangePushA("GDS Transfer");
     auto t0_transfer = clk::now();
-
     ssize_t bytes_read = single_big_gds_read(cf_handle, d_buffer, file_size);
     if (bytes_read < 0)
     {
@@ -528,38 +509,37 @@ int main(int argc, char **argv)
         close(fd);
         return 1;
     }
-
-    // Ensure device synchronization
     CUDA_CHECK(cudaDeviceSynchronize());
     auto t1_transfer = clk::now();
     double transfer_seconds = chrono::duration<double>(t1_transfer - t0_transfer).count();
-    nvtxRangePop(); // GDS Transfer
 
-    // Pre-scan for line count (we already had a function)
-    size_t num_lines = get_line_count(opt.filename);
-    cout << "Pre-scanned file, found ~" << num_lines << " lines.\n";
+    // Run the full parsing pipeline
+    ParseResult parse_result = run_parse_stage(d_buffer, file_size, opt.delim);
 
-    // Run parse stage
-    auto parse_result = run_parse_stage(d_buffer, file_size, num_lines, opt.delim);
-
-    // Copy a small host slice for print_head (we'll copy up to 1KB or file_size)
     size_t head_copy_size = min(file_size, (size_t)1024);
     vector<char> host_head(head_copy_size);
     CUDA_CHECK(cudaMemcpy(host_head.data(), d_buffer, head_copy_size, cudaMemcpyDeviceToHost));
     print_head(host_head.data(), head_copy_size);
 
-    // Print final summary
-    size_t io_errors = 0; // we only do a single read attempt with fallback loop; count errors if ret < 0
-    print_summary(file_size, transfer_seconds, parse_result.first, parse_result.second, opt.odirect, io_errors);
+    print_summary(file_size, transfer_seconds, parse_result, opt.odirect);
+
+    // Final verification: Print last element from the parsed data
+    if (parse_result.d_final_data && parse_result.total_items > 0) {
+        unsigned int last_element;
+        CUDA_CHECK(cudaMemcpy(&last_element, parse_result.d_final_data + parse_result.total_items - 1, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        cout << "\nVerification: Last parsed integer is " << last_element << std::endl;
+    }
+
 
     // Cleanup
-    nvtxRangePushA("Cleanup");
     GDS_CHECK(cuFileBufDeregister(d_buffer));
     cuFileHandleDeregister(cf_handle);
     GDS_CHECK(cuFileDriverClose());
     close(fd);
     CUDA_CHECK(cudaFree(d_buffer));
-    nvtxRangePop(); // Cleanup
+    if (parse_result.d_final_data) {
+        CUDA_CHECK(cudaFree(parse_result.d_final_data));
+    }
 
     return 0;
 }
