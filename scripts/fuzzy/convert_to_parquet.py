@@ -4,8 +4,6 @@ import argparse
 import sys
 from pathlib import Path
 import re
-import os
-import math
 
 try:
     import cudf
@@ -20,7 +18,7 @@ def convert_text_to_parquet(
     sep: str = "\t",
     compression: str = "zstd",
 ) -> str:
-    """Convert transactional text to long-format Parquet (item, prob, txn_id) using cuDF.
+    """Convert transactional text to long-format Parquet (txn_id, item, prob) using cuDF.
 
     Returns: Parquet file path (str).
     """
@@ -37,32 +35,59 @@ def convert_text_to_parquet(
     df = cudf.read_csv(
         input_path,
         sep=":",
-        header=None,
         names=["items", "values"],
         dtype=["str", "str"],
     )
-    
+
     # Clean trailing whitespace
     sep_esc = re.escape(sep)
     pattern = rf"[{sep_esc}\r\n ]+$"
     df["items"] = df["items"].str.replace(pattern, "", regex=True)
     df["values"] = df["values"].str.replace(pattern, "", regex=True)
-    
-    df['txn_id'] = (cudf.core.column.arange(0, len(df)) + 1).astype("uint32")
 
+    # Add txn_id starting from 1 before exploding
+    # Using index + 1 is efficient and correct here since we just read the file
+    df['txn_id'] = df.index + 1
+    df['txn_id'] = df['txn_id'].astype('uint32')
+
+
+    # Explode items and values. 
+    # We must explode both simultaneously to keep them aligned.
+    # Since cuDF explode doesn't support multiple columns simultaneously in the same way pandas might,
+    # we can use a common index to merge them back or explode them individually if they are guaranteed same length.
+    # A safer way in cuDF for simultaneous explode is often to use `explode` on one and rely on index, but here's a robust approach:
+    
     df_long = cudf.DataFrame({
+        'txn_id': df['txn_id'].repeat(df['items'].str.count(sep) + 1), # repeat txn_id for each item
         'item': df['items'].str.split(sep).explode(),
         'prob': df['values'].str.split(sep).explode(),
-        'txn_id': df['txn_id'].repeat(df['items'].str.count(sep) + 1),
     })
+    # print(df_long)
+
+    # Note: The above 'repeat' assumes 'items' and 'values' have same number of elements per row.
+    # A simpler, more robust way often favored in cuDF if just exploding:
     
-    df_long = df_long[df_long['item'] != '']
-    df_long['prob'] = df_long['prob'].astype('uint32')
+    # # Alternative robust explode:
+    # # df_exploded = df.explode(['items', 'values']) # Only works if they are lists, currently they are strings to split
+    # # So we split first:
+    # df['items'] = df['items'].str.split(sep)
+    # df['values'] = df['values'].str.split(sep)
+    
+    # Now explode both. cuDF's explode can take a list of columns to explode simultaneously
+    # if they have matching list lengths in each row.
+    # df_long = df.explode(['items', 'values']).rename(columns={'items': 'item', 'values': 'prob'})
+
+
+    df_long = df_long[df_long['item'] != ''] # Remove empty items if any
+    df_long['prob'] = df_long['prob'].astype('float64')
+    
+    # Reorder columns to preferred (txn_id, item, prob)
+    df_long = df_long[['txn_id', 'item', 'prob']]
+
+    print(f"[convert] method=cudf rows={len(df_long)} file={output_path}")
     
     df_long.to_parquet(output_path, compression=compression)
     
-    variant = "fixed" if re.search(r"_fixed(\.|$)", input_path.name) else ("floating" if re.search(r"_floating(\.|$)", input_path.name) else "unknown")
-    print(f"[convert] done method=cudf rows={len(df_long)} variant={variant} file={output_path}")
     return str(output_path)
 
 
@@ -74,10 +99,6 @@ def main():
     parser.add_argument("outputFile", nargs='?', default=None, help="Optional. Path to the output Parquet file.")
     parser.add_argument("--sep", default="\t", help="Item/value separator inside a line (default: TAB)")
     parser.add_argument("--compression", default="zstd", help="Parquet compression codec (zstd,snappy,gzip,none).")
-    # Retaining old args for compatibility, but they are not used.
-    parser.add_argument("--fast", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--method", choices=["cudf"], default="cudf", help=argparse.SUPPRESS)
-    parser.add_argument("--chunk-size", type=int, default=200000, help=argparse.SUPPRESS)
     
     args = parser.parse_args()
     try:

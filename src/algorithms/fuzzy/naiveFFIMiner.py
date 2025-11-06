@@ -39,7 +39,7 @@ INV_LOAD_FACTOR = 3/2
 SENTINEL = 0
 FIRST_ID = 1
 
-KVPair = np.dtype([("line", np.uint32), ("probability", np.uint64)], align=True)
+KVPair = np.dtype([("line", np.uint32), ("probability", np.float64)], align=True)
 HashTable = np.dtype(
     [
         ("table_ptr", np.uintp),
@@ -51,6 +51,8 @@ HashTable = np.dtype(
     ],
     align=True,
 )
+TwoItem = np.dtype([("first", np.uint32), ("second", np.uint32)], align=True)
+
 
 
 # -----------------------
@@ -59,8 +61,9 @@ HashTable = np.dtype(
 KERNEL_SRC = r"""
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
+typedef double float64_t;
 
-struct KVPair { uint32_t line; uint64_t probability; };
+struct KVPair { uint32_t line; float64_t probability; };
 
 struct hash_table {
     KVPair*  table;   // open-addressing buckets
@@ -71,36 +74,144 @@ struct hash_table {
     uint32_t arr_len;
 };
 
+struct TwoItem { uint32_t first; uint32_t second; };
+
 __device__ __forceinline__ uint32_t mul_hash(uint32_t k){ return k * 0x9E3779B1u; }
 __device__ __forceinline__ uint64_t ullmin_dev(uint64_t a, uint64_t b){ return (a < b) ? a : b; }
+__device__ __forceinline__ float64_t f64min_dev(float64_t a, float64_t b){ return (a < b) ? a : b; }
+
 #define SENTINEL 0u
 #define FIRST_ID 1u
 
-extern "C" __global__ void number_of_new_candidates_to_generate(const uint32_t *c, uint32_t n, uint32_t k, uint32_t *out){
+
+extern "C" __global__ void number_of_new_candidates_to_generate(const uint32_t *c, uint32_t n, uint32_t k, uint32_t *out, const TwoItem* ht2, const uint32_t num_buckets)
+{
     uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; if (i >= n) return;
-    if (k == 1) { out[i+1] = n - i - 1; return; }
+    if (k == 1) { 
+        out[i+1] = n - i - 1; 
+        return; 
+    }
 
     uint32_t count = 0;
+    uint32_t original = 0;
+
     for (uint32_t j = i + 1; j < n; ++j){
         bool same = true;
         for (uint32_t l = 0; l < k - 1; ++l){
-            if (c[i*k+l] != c[j*k+l]) { same = false; break; }
+            if (c[i*k+l] != c[j*k+l]) 
+            { 
+                same = false; 
+                break; 
+            }
         }
-        // if (same) atomicAdd(&out[i+1], 1u);
-        if (same) count++;
+        if (!same) break; // early exit
+
+        // original++;
+        // check if the pair (c[i][k-1], c[j][k-1]) exists in ht2
+        uint32_t first = c[i*k + (k-1)];
+        uint32_t second = c[j*k + (k-1)];
+        uint32_t h = mul_hash(first);
+        h ^= mul_hash(second);
+        uint32_t mask = num_buckets - 1;
+        bool found = false;
+        while (true) {
+            uint32_t cur_first = ht2[h].first;
+            uint32_t cur_second = ht2[h].second;
+            if (cur_first == first && cur_second == second) {
+                found = true;
+                break;
+            }
+            if (cur_first == SENTINEL) {
+                break; // not found
+            }
+            h = (h + 1u) & mask;
+        }
+
+        if (found)
+            ++count;
     }
 
     out[i+1] = count;
 }
 
 
-extern "C" __global__ void write_the_new_candidates(const uint32_t *c, uint32_t n, uint32_t k, const uint32_t *idx, uint32_t *out){
-    uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; if (i >= n) return;
-    uint32_t slice = idx[i+1] - idx[i]; if (!slice) return;
+
+
+extern "C" __global__ void write_the_new_candidates(const uint32_t *c, uint32_t n, uint32_t k, const uint32_t *idx, uint32_t *out, const TwoItem* ht2, const uint32_t num_buckets)
+{
+    uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; 
+    if (i >= n) return;
+    uint32_t slice = idx[i+1] - idx[i]; 
+
+    if (!slice) return; // early exit
+
     uint32_t base = idx[i] * (k + 1);
-    for (uint32_t j = 0; j < slice; ++j){
-        for (uint32_t l = 0; l < k; ++l){ out[base + j*(k+1) + l] = c[i*k+l]; }
-        out[base + j*(k+1) + k] = c[(i+1+j)*k + (k-1)];
+
+    uint32_t found_count = 0;
+
+
+    if (k == 1)
+    {
+        for (uint32_t j = 0; j < slice; ++j) 
+        {
+            for (uint32_t l = 0; l < k; ++l)
+            { 
+                out[base + j*(k+1) + l] = c[i*k+l]; 
+            }
+            out[base + j*(k+1) + k] = c[(i+1+j)*k + (k-1)]; 
+        }
+        return;
+    }
+    else 
+    {
+        for (uint32_t j = i + 1; j < n; ++j){ // from candidate i, compare with all (n) other candidates after `j` 
+            bool same = true; 
+            for (uint32_t l = 0; l < k - 1; ++l) // compare first k-1 items
+            { 
+                // if the prefix of length k-1 matches
+                if (c[i*k+l] != c[j*k+l]) 
+                { 
+                    same = false; 
+                    break; 
+                }
+            }
+
+            if (!same) break; // early exit
+
+            // check if the pair (c[i][k-1], c[j][k-1]) exists in ht2
+            uint32_t first = c[i*k + (k-1)];
+            uint32_t second = c[j*k + (k-1)];
+
+            uint32_t h = mul_hash(first);
+            h ^= mul_hash(second);
+            uint32_t mask = num_buckets - 1;
+            bool found = false;
+            while (true) {
+                uint32_t cur_first = ht2[h].first;
+                if (cur_first == first) {
+                    if (ht2[h].second == second) {
+                        found = true;
+                    }
+                    break;
+                }
+                if (cur_first == SENTINEL) {
+                    break;
+                }
+                h = (h + 1u) & mask;
+            }
+            
+
+            if (!found) continue;
+
+            for (uint32_t l = 0; l < k; ++l)
+            { 
+                out[base + found_count*(k+1) + l] = c[i*k+l]; 
+            }
+            out[base + found_count*(k+1) + k] = c[j*k + (k-1)];
+
+            found_count++;
+
+        }
     }
 }
 
@@ -109,7 +220,7 @@ extern "C" __global__ void write_dense_arrays(
     uint64_t total,
     const uint32_t* __restrict__ items,
     const uint32_t* __restrict__ lines,
-    const uint64_t* __restrict__ probs,
+    const float64_t* __restrict__ probs,
     hash_table* __restrict__ hts,
     uint32_t* __restrict__ counters
 ){
@@ -122,21 +233,27 @@ extern "C" __global__ void write_dense_arrays(
     }
 }
 
-__device__ __forceinline__ void ht_insert(hash_table &ht, uint32_t key, uint64_t val){
+__device__ __forceinline__ void ht_insert(hash_table &ht, uint32_t key, float64_t val){
     uint32_t h = mul_hash(key) & ht.mask;
     while (true){
         uint32_t old = atomicCAS(&ht.table[h].line, SENTINEL, key);
-        if (old == SENTINEL || old == key){ atomicExch(&ht.table[h].probability, val); break; }
+        if (old == SENTINEL){ 
+            // atomicExch(&ht.table[h].probability, val); 
+            // atomicExch((unsigned long long*)&ht.table[h].probability, __double_as_longlong(val));
+            ht.table[h].probability = val;
+            break; 
+        }
         h = (h + 1u) & ht.mask;
     }
 }
 
-extern "C" __global__ void build_tables(uint64_t total, const uint32_t *items, const uint32_t *lines, const uint64_t *probs, hash_table* hts){
-    uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x; if (tid >= total) return;
+extern "C" __global__ void build_tables(uint64_t total, const uint32_t *items, const uint32_t *lines, const float64_t *probs, hash_table* hts){
+    uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x; 
+    if (tid >= total) return;
     ht_insert(hts[items[tid]], lines[tid], probs[tid]);
 }
 
-__device__ uint64_t ht_get(const hash_table &ht, uint32_t key){
+__device__ float64_t ht_get(const hash_table &ht, uint32_t key){
     uint32_t h = mul_hash(key) & ht.mask;
     while (true){
         uint32_t cur = ht.table[h].line; if (cur == key) return ht.table[h].probability;
@@ -151,20 +268,21 @@ extern "C" __global__ void mine_kernel(
     uint32_t nCands, uint32_t candSize,
     uint64_t* __restrict__ supports
 ){
-    uint32_t bid = blockIdx.x; if (bid >= nCands) return;
+    uint32_t bid = blockIdx.x; if (bid > nCands) return;
     const hash_table& htEnd = hts[cands[bid*candSize + (candSize - 1)]];
     uint32_t reqHits = candSize - 1u;
     uint64_t local_support = 0;
 
     for (uint32_t i = threadIdx.x; i < htEnd.arr_len; i += blockDim.x){
         uint32_t line = htEnd.arr[i].line;
-        uint64_t min_p = htEnd.arr[i].probability;
+        float64_t min_p = htEnd.arr[i].probability;
         uint32_t hits = 0u;
         #pragma unroll 1
         for (uint32_t j = 0; j < reqHits; ++j){
-            uint64_t p = ht_get(hts[cands[bid*candSize + j]], line);
+            float64_t p = ht_get(hts[cands[bid*candSize + j]], line);
             if (p == 0){ hits = 0u; break; }
-            min_p = ullmin_dev(min_p, p);
+            //min_p = ullmin_dev(min_p, p);
+            min_p = f64min_dev(min_p, p);
             ++hits;
         }
         if (hits == reqHits){
@@ -175,6 +293,45 @@ extern "C" __global__ void mine_kernel(
         atomicAdd(&supports[bid], local_support);
     }
 }
+
+
+
+extern "C" __global__ void build_ht2(const uint32_t n, const uint32_t (*cands)[2], struct TwoItem* ht2, uint32_t num_buckets)
+{
+    uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; if (i >= n) return;
+    uint32_t first = cands[i][0];
+    uint32_t second = cands[i][1];
+
+    // simple multiplicative hash
+    uint32_t h = mul_hash(first);
+    h ^= mul_hash(second);
+
+    // linear probing
+    uint32_t mask = num_buckets - 1;
+    while (true) {
+        uint32_t old_first = atomicCAS(&ht2[h].first, SENTINEL, first);
+        if (old_first == SENTINEL) {
+            // either inserted new or found existing 'first'
+            atomicExch(&ht2[h].second, second);
+            break;
+        }
+        h = (h + 1u) & mask;
+    }
+}
+
+
+extern "C" __global__ void print_htable(const hash_table* __restrict__ hts, uint32_t item)
+{
+    const hash_table& ht = hts[item];
+    printf("Hash Table for item %u: table_size=%u, arr_size=%u\n", item, ht.length, ht.arr_len);
+    for (uint32_t i = 0; i < ht.length; ++i){
+        if (ht.table[i].line != SENTINEL){
+            printf("%u:%f\n", ht.table[i].line, ht.table[i].probability);
+        }
+    }
+}
+
+
 """
 
 
@@ -212,8 +369,8 @@ def _init_allocator(mode: str, use_pinned: bool = False) -> Tuple[Optional[objec
     return dev_pool, pin_pool
 
 
-def _compile_kernels() -> Tuple[cp.RawKernel, cp.RawKernel, cp.RawKernel, cp.RawKernel, cp.RawKernel]:
-    """Compile and return CUDA kernels from the embedded source with nvcc backend."""
+def _compile_kernels():
+    """Compile and return CUDA kernels from the embedded source via nvcc backend."""
     opts = ("-std=c++14", "-O3", "-Xptxas=-v", "-Xptxas=--warn-on-spills", "-Xptxas=-dlcm=ca", "-lineinfo")
     mod = cp.RawModule(code=KERNEL_SRC, backend="nvcc", options=opts)
     return (
@@ -222,6 +379,8 @@ def _compile_kernels() -> Tuple[cp.RawKernel, cp.RawKernel, cp.RawKernel, cp.Raw
         mod.get_function("build_tables"),
         mod.get_function("mine_kernel"),
         mod.get_function("write_dense_arrays"),
+        mod.get_function("build_ht2"),
+        mod.get_function("print_htable"),
     )
 
 
@@ -236,25 +395,19 @@ class naiveFFIMiner(BaseAlgorithm):
         iFile: Union[str, Path],
         min_support: float,
         sep: str = "\t",
-        forced_quant_mult: Optional[int] = None,
         allocator: str = "rmm_device",
-        pinned: bool = False,
-        managed_prefetch: bool = False,
         debug: bool = False,
     ) -> None:
         """Configure I/O, thresholds, allocator pools, and compile kernels."""
         super().__init__(iFile=iFile, debug=debug)
         self.debug = bool(debug)
         self._sep = sep
-        self.min_support_float = float(min_support)
-        self.forced_quant_mult = forced_quant_mult
+        self.min_support = float(min_support)
         self.scale_factor = 1
-        self._minSup_scaled: int = 0
         self._gpu_memory_usage = 0
         self.patterns: Dict[Tuple[str, ...], float] = {}
-        self._managed_prefetch = bool(managed_prefetch)
 
-        self._dev_pool, self._pin_pool = _init_allocator(allocator, use_pinned=pinned)
+        self._dev_pool, self._pin_pool = _init_allocator(allocator)
 
         # Peaks (optional; still computed for print_results)
         self._peak_driver_used = 0
@@ -272,7 +425,7 @@ class naiveFFIMiner(BaseAlgorithm):
         self._theory_static_map: Dict[str, int] = {}
         self._theory_trace: List[Dict[str, Any]] = []
 
-        self._kern_num, self._kern_write, self._kern_build, self._kern_mine, self._kern_write_dense = _compile_kernels()
+        self._kern_num, self._kern_write, self._kern_build, self._kern_mine, self._kern_write_dense, self._kern_build_ht2, self._kern_print = _compile_kernels()
 
     # -------------------
     # Manual memory helpers (deterministic sizes)
@@ -432,52 +585,33 @@ class naiveFFIMiner(BaseAlgorithm):
     # -------------------
     # Data loading & prep
     # -------------------
-    def _cpu_load_and_scale_data(self) -> pl.DataFrame:
-        """Load text/parquet with Polars, explode rows, and quantize probabilities to UInt32."""
+    def _readParquet(self) -> pl.DataFrame:
+        """Read Parquet input using Polars; return DataFrame."""
         path = str(self._iFile)
         if path.lower().endswith(".parquet"):
             df = pl.read_parquet(path)
-            prob_col = "prob"
+            # if not have cols item or prob, raise
+            if "item" not in df.columns or "prob" not in df.columns:
+                raise ValueError("Input Parquet must have 'item', 'prob' columns.")
         else:
-            lazy_txns = pl.scan_csv(
-                path, has_header=False, separator=":", new_columns=["items_str", "values_str"]
-            ).with_row_index("txn_id", offset=1)
-            df = (
-                lazy_txns.with_columns(
-                    pl.col("items_str").str.split(self._sep),
-                    pl.col("values_str").str.split(self._sep),
-                )
-                .filter(pl.col("items_str").list.len() == pl.col("values_str").list.len())
-                .explode(["items_str", "values_str"])
-                .rename({"items_str": "item", "values_str": "prob"})
-            ).collect()
-            prob_col = "prob"
+            raise NotImplementedError("Only Parquet input is supported.")
 
-        if self.forced_quant_mult is not None:
-            self.scale_factor = int(self.forced_quant_mult)
+        if "__index_level_0__" in df.columns and "txn_id" not in df.columns:
+            df = df.rename({"__index_level_0__": "txn_id"})
+            # add 1 if txn_id is not starting from 0
+            if df["txn_id"].min() == 0:
+                # add 1 to txn_id
+                df = df.with_columns((pl.col("txn_id") + 1).alias("txn_id"))
         else:
-            max_decimals = (
-                df.get_column(prob_col)
-                .cast(pl.Utf8)
-                .str.split_exact(".", 1)
-                .struct.field("field_1")
-                .str.len_chars()
-                .fill_null(0)
-                .max()
-            )
-            self.scale_factor = 10 ** int(max_decimals or 0)
-
-        self._minSup_scaled = int(self.min_support_float * self.scale_factor)
-
-        df_scaled = df.with_columns(
-            (pl.col(prob_col).cast(pl.Float64) * self.scale_factor).cast(pl.UInt32).alias("prob")
-        ).select(pl.col("item").cast(pl.Utf8), pl.col("prob"), pl.col("txn_id").cast(pl.UInt32))
-        return df_scaled
+            if "txn_id" not in df.columns:
+                raise ValueError("Input Parquet must have 'txn_id' column.")
+            
+        return df
 
     def _calculate_support_and_filter_items(self, df: pl.DataFrame):
         """Compute item supports, filter by threshold, and assign dense IDs; return (support_df, final_df)."""
         support_df = df.group_by("item").agg(pl.sum("prob"), pl.len().alias("freq"))
-        support_df = support_df.filter(pl.col("prob") >= self._minSup_scaled).sort("freq", descending=True)
+        support_df = support_df.filter(pl.col("prob") >= self.min_support).sort("freq", descending=True)
         if len(support_df) == 0:
             return None, None
         n_items = len(support_df)
@@ -491,6 +625,7 @@ class naiveFFIMiner(BaseAlgorithm):
         self.rename_map[support_df["new_id"].to_numpy()] = support_df["item"].to_numpy()
         final_df = df.join(support_df.select("item", "new_id"), on="item").drop("item").rename({"new_id": "item"})
         self.support_df = support_df
+
         return support_df, final_df
 
     @staticmethod
@@ -539,7 +674,7 @@ class naiveFFIMiner(BaseAlgorithm):
         """Transfer columns to GPU, build hash tables, and populate dense arrays."""
         self.item_col = cp.asarray(final_df["item"].to_numpy(), dtype=cp.uint32)
         self.line_col = cp.asarray(final_df["txn_id"].to_numpy(), dtype=cp.uint32)
-        self.prob_col = cp.asarray(final_df["prob"].to_numpy(), dtype=cp.uint64)
+        self.prob_col = cp.asarray(final_df["prob"].to_numpy(), dtype=cp.float64)
         self._ht_dev = self._to_device_struct(ht_host)
 
         total_pairs = len(self.item_col)
@@ -557,32 +692,24 @@ class naiveFFIMiner(BaseAlgorithm):
         cp.cuda.runtime.deviceSynchronize()
         self._snap_mem()
 
-        if self._managed_prefetch:
-            try:
-                dev = cp.cuda.runtime.getDevice()
-                cp.cuda.runtime.memPrefetchAsync(self.buckets.data.ptr, self.buckets.nbytes, dev, 0)
-                cp.cuda.runtime.memPrefetchAsync(self.dense.data.ptr, self.dense.nbytes, dev, 0)
-            except Exception:
-                pass
-
     # -------------------
     # Candidate generation (returns temps size)
     # -------------------
-    def _generate_next_candidates(self, cands: cp.ndarray, k: int):
+    def _generate_next_candidates(self, cands: cp.ndarray, k: int, ht2: Optional[cp.ndarray] = None) -> Tuple[cp.ndarray, int]:
         """Generate (k+1)-item candidates and return (array, temp_bytes_during_generation)."""
         n = len(cands)
         if n == 0:
             return cp.array([], dtype=cp.uint32), 0
         grid = (n + self._max_threads - 1) // self._max_threads
-        num = cp.zeros(n + 1, dtype=cp.uint32)  # temp
-        self._kern_num((grid,), (self._max_threads,), (cands, n, k, num))
-        idx = cp.cumsum(num, dtype=cp.uint32)  # temp
+        num = cp.zeros(n + 1, dtype=cp.uint32)                 # temp
+        self._kern_num((grid,), (self._max_threads,), (cands, n, k, num, ht2, 0 if ht2 is None else len(ht2)))
+        idx = cp.cumsum(num, dtype=cp.uint32)                  # temp
         out_len = int(idx[-1].get())
         if out_len == 0:
-            gen_tmp_bytes = int(num.nbytes + idx.nbytes)
-            return cp.array([], dtype=cp.uint32), gen_tmp_bytes
-        nxt = cp.zeros((out_len, k + 1), dtype=cp.uint32)  # temp
-        self._kern_write((grid,), (self._max_threads,), (cands, n, k, idx, nxt))
+            return cp.array([], dtype=cp.uint32), int(num.nbytes + idx.nbytes)
+        nxt = cp.zeros((out_len, k + 1), dtype=cp.uint32)      # temp
+        # self._kern_write((grid,), (self._max_threads,), (cands, n, k, idx, nxt))
+        self._kern_write((grid,), (self._max_threads,), (cands, n, k, idx, nxt, ht2, 0 if ht2 is None else len(ht2)))
         gen_tmp_bytes = int(num.nbytes + idx.nbytes + nxt.nbytes)
         return nxt, gen_tmp_bytes
 
@@ -596,16 +723,22 @@ class naiveFFIMiner(BaseAlgorithm):
             raise FileNotFoundError(f"Input file not found: {path}")
 
         _t0 = time.time()
-        exploded_df = self._cpu_load_and_scale_data()
+        exploded_df = self._readParquet()
         support_df, final_df = self._calculate_support_and_filter_items(exploded_df)
         if support_df is None:
             self.patterns = {}
             return
 
+        # add patterns for single items
+        self.patterns = {(item,): float(prob) / float(self.scale_factor)
+            for item, prob in zip(support_df["item"].to_numpy(), support_df["prob"].to_numpy())}
+
         ht_host = self._allocate_gpu_hash_tables(support_df)
         self._build_gpu_hash_tables(ht_host, final_df)
         del exploded_df, support_df, final_df
         gc.collect()
+
+        # self._kern_print((1,), (1,), (self._ht_dev, 75))
 
         # Static breakdown after build
         static_map = self._static_bytes_post_build()
@@ -615,6 +748,10 @@ class naiveFFIMiner(BaseAlgorithm):
         k = 1
         candidates = cp.asarray(self.support_df["new_id"].to_numpy()).reshape(-1, 1)
         gpu_results = []
+
+        ht2 = None  # for k=2 lookups
+
+
         while len(candidates) > 0:
             print(f"--- k={k} candidates: {len(candidates)} ---")
 
@@ -622,7 +759,7 @@ class naiveFFIMiner(BaseAlgorithm):
             self._record_manual_report(f"k={k}/start", static_map=static_map, candidates=candidates)
 
             # Candidate generation
-            next_candidates, gen_tmp_bytes = self._generate_next_candidates(candidates, k)
+            next_candidates, gen_tmp_bytes = self._generate_next_candidates(candidates, k, ht2)
             self._record_manual_report(
                 f"k={k}/gen",
                 static_map=static_map,
@@ -644,7 +781,7 @@ class naiveFFIMiner(BaseAlgorithm):
             )
             cp.cuda.runtime.deviceSynchronize()
 
-            mask = supports >= self._minSup_scaled
+            mask = supports >= self.min_support
             frequent = next_candidates[mask]
 
             # Report mining peak (cands + next + supports + mask coexist)
@@ -664,6 +801,13 @@ class naiveFFIMiner(BaseAlgorithm):
 
             # Steady post (only static + frequent)
             self._record_manual_report(f"k={k}/post", static_map=static_map, frequent=frequent)
+
+            if k == 2:
+                num_buckets = int(2 ** np.ceil(np.log2(len(frequent) * INV_LOAD_FACTOR)))
+                ht2 = cp.zeros(num_buckets, dtype=TwoItem)
+                self._kern_build_ht2(((len(frequent) + self._max_threads - 1) // self._max_threads,), (self._max_threads,), (len(frequent), frequent, ht2, num_buckets))
+                cp.cuda.runtime.deviceSynchronize()
+
 
             # Free temps and advance
             del supports, mask, next_candidates
@@ -692,9 +836,12 @@ class naiveFFIMiner(BaseAlgorithm):
 
     # -------------------
     # Results & I/O
-    # -------------------
+    # # -------------------
     def _process_results(self, gpu_results) -> None:
         """Assemble singleton and higher-order itemset supports into a Python dict."""
+
+
+
         patterns = {
             (item,): float(prob) / float(self.scale_factor)
             for item, prob in zip(self.support_df["item"].to_numpy(), self.support_df["prob"].to_numpy())
@@ -709,7 +856,7 @@ class naiveFFIMiner(BaseAlgorithm):
         """Write mined itemsets and supports to a TSV file."""
         with open(oFile, "w") as f:
             for itemset, support in self.patterns.items():
-                f.write(f"{','.join(itemset)}\t{support}\n")
+                f.write(f"{'\t'.join(itemset)}:{support}\n")
 
     def print_results(self) -> None:
         """Print concise runtime and memory telemetry plus pattern count."""
@@ -757,10 +904,7 @@ def _cli() -> None:
         iFile=args.iFile,
         min_support=args.min_support,
         sep=args.sep,
-        forced_quant_mult=args.forced_quant_mult,
         allocator=args.allocator,
-        pinned=args.pinned,
-        managed_prefetch=args.managed_prefetch,
         debug=args.debug,
     )
     miner.mine()

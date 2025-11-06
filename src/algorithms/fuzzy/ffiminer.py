@@ -1,59 +1,11 @@
-# Fuzzy Frequent  Pattern-Miner is desired to find all  frequent fuzzy patterns which is on-trivial and challenging problem to its huge search space.we are using efficient pruning techniques to reduce the search space.
-#
-# **Importing this algorithm into a python program**
-#
-#             from PAMI.fuzzyFrequentPattern import FFIMiner as alg
-#
-#             iFile = 'sampleTDB.txt'
-#
-#             minSup = 0.25 # can be specified between 0 and 1
-#
-#             obj = alg.FFIMiner(iFile, minSup, sep)
-#
-#             obj.mine()
-#
-#             fuzzyFrequentPattern = obj.getPatterns()
-#
-#             print("Total number of Fuzzy Frequent Patterns:", len(fuzzyFrequentPattern))
-#
-#             obj.save("outputFile")
-#
-#             memUSS = obj.getMemoryUSS()
-#
-#             print("Total Memory in USS:", memUSS)
-#
-#             memRSS = obj.getMemoryRSS()
-#
-#             print("Total Memory in RSS", memRSS)
-#
-#             run = obj.getRuntime()
-#
-#             print("Total ExecutionTime in seconds:", run)
-#
 
-
-__copyright__ = """
-Copyright (C)  2021 Rage Uday Kiran
-
-     This program is free software: you can redistribute it and/or modify
-     it under the terms of the GNU General Public License as published by
-     the Free Software Foundation, either version 3 of the License, or
-     (at your option) any later version.
-
-     This program is distributed in the hope that it will be useful,
-     but WITHOUT ANY WARRANTY; without even the implied warranty of
-     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-     GNU General Public License for more details.
-
-     You should have received a copy of the GNU General Public License
-     along with this program.  If not, see <https://www.gnu.org/licenses/>.
-     Copyright (C)  2021 Rage Uday Kiran
-
-"""
 
 from PAMI.fuzzyFrequentPattern.basic import abstract as _ab
 from typing import List, Dict, Tuple, Set, Union, Any, Generator
 from deprecated import deprecated
+import tqdm
+import argparse
+
 
 class FFIMiner(_ab._fuzzyFrequentPattenrs):
     """
@@ -244,7 +196,7 @@ class FFIMiner(_ab._fuzzyFrequentPattenrs):
                 value = int(value)
         return value
     
-    def dfs(self, cands):
+    def dfs(self, cands, base):
         """
         Perform depth-first search (DFS) to find frequent patterns in a database.
 
@@ -260,7 +212,8 @@ class FFIMiner(_ab._fuzzyFrequentPattenrs):
         support counts.
         """
         for i in range(len(cands)):
-            print(f"Processing candidate {i+1}/{len(cands)}: {cands[i]}")
+        # for i in tqdm.tqdm(range(len(cands)), desc="Mining Patterns", unit="pattern"):
+            # print(f"Processing candidate {i+1}/{len(cands)}: {cands[i]}")
             newCands = []
             for j in range(i + 1, len(cands)):
                 newCand = tuple(cands[i] + tuple([cands[j][-1]]))
@@ -272,10 +225,15 @@ class FFIMiner(_ab._fuzzyFrequentPattenrs):
                 count = sum(newCandItems.values())
                 if count >= self._minSup:
                     newCands.append(newCand)
-                    self._finalPatterns[newCand] = count
+                    # add base to newCand
                     self._Database[newCand] = newCandItems
+
+                    if base:
+                        newCand = tuple(base + newCand)
+
+                    self._finalPatterns[newCand] = count
             if len(newCands) > 1:
-                self.dfs(newCands)
+                self.dfs(newCands, tuple(base + cands[i]))
 
     def mine(self):
         """
@@ -285,7 +243,6 @@ class FFIMiner(_ab._fuzzyFrequentPattenrs):
         items = {}
         lineNo = 0
         self._creatingItemsets()
-        print("Total number of transactions in the database:", len(self._transactions))
 
         self._dbLen = len(self._transactions)
         for transactions, fuzzyValues in zip(self._transactions, self._fuzzyValues):
@@ -299,6 +256,9 @@ class FFIMiner(_ab._fuzzyFrequentPattenrs):
         self._minSup = self._convert(self._minSup)
         self._Database = items.copy()
 
+        # print 19.H dictionary
+        # print(items.get(('19.H',), 'Not found'))
+
         supports = {k:sum(v.values()) for k,v in items.items()}
         supports = {k:v for k,v in supports.items() if v >= self._minSup}
         self._Database = {k:v for k,v in items.items() if k in supports}
@@ -307,7 +267,7 @@ class FFIMiner(_ab._fuzzyFrequentPattenrs):
         self._finalPatterns = supports.copy()
 
         cands = list(self._Database.keys())
-        self.dfs(cands)
+        self.dfs(cands, tuple())
 
         self._endTime = _ab._time.time()
         process = _ab._psutil.Process(_ab._os.getpid())
@@ -386,7 +346,12 @@ class FFIMiner(_ab._fuzzyFrequentPattenrs):
         #     patternsAndSupport = x.strip() + ":" + str(y)
         #     writer.write("%s \n" % patternsAndSupport)
         with open(outFile, 'w') as f:
-            for x, y in self._finalPatterns.items():
+            # sort finalPatterns by length of key and then lexicographically
+            sortedPatterns = sorted(self._finalPatterns.items(), key=lambda item: (len(item[0]), item[0]))
+
+            for x, y in sortedPatterns:
+                # remove duplicate items in x
+                x = list(dict.fromkeys(x))
                 x = "\t".join(x)
                 f.write(f"{x}:{y}\n")
 
@@ -394,34 +359,92 @@ class FFIMiner(_ab._fuzzyFrequentPattenrs):
         """
         This function is used to print the results
         """
-        print("Total number of Fuzzy Frequent Patterns:", len(self.getPatterns()))
-        print("Total Memory in USS:", self.getMemoryUSS())
-        print("Total Memory in RSS", self.getMemoryRSS())
-        print("Total ExecutionTime in seconds:", self.getRuntime())
+        # print("Total number of Fuzzy Frequent Patterns:", len(self.getPatterns()))
+        # print("Total Memory in USS:", self.getMemoryUSS())
+        # print("Total Memory in RSS", self.getMemoryRSS())
+        # print("Total Execution Time in seconds:", self.getRuntime())
+        print(f"\n--- {self.__class__.__name__} Results ---")
+        print(f"Execution Time: {self.getRuntime():.4f} seconds")
+        print(f"Peak CPU Memory Usage: {self.getMemoryRSS() / (1024**2):.2f} MB")
+        print(f"Total Patterns Found: {len(self.getPatterns())}")
+        print("--------------------" + "-" * len(self.__class__.__name__))
 
+
+    
+    # def print_results(self) -> None:
+    #     """Print concise runtime, memory telemetry (RMM + theory), and pattern count."""
+    #     theory_static_mb = self._mb(self.get_theory_memory_bytes("static"))
+    #     theory_peak_mb = self._mb(self.get_theory_memory_bytes("peak"))
+
+    #     print(f"\n--- {self.__class__.__name__} Results ---")
+    #     print(f"Execution Time: {self.get_execution_time():.4f} seconds")
+    #     print(f"Peak CPU Memory Usage: {self.get_memory_usage():.2f} MB")
+    #     print(f"Peak GPU (driver) Used: {self._peak_driver_used / (1024**2):.2f} MB")
+    #     print(f"Peak Pool Used:        {self._peak_pool_used / (1024**2):.2f} MB")
+    #     print(f"Peak Pool Total:       {self._peak_pool_total / (1024**2):.2f} MB")
+    #     if self._rmm_peak_bytes is not None:
+    #         print(f"RMM Statistics Peak:   {self._rmm_peak_bytes / (1024**2):.2f} MB")
+    #     print(f"Theoretical Static:    {theory_static_mb} MB")
+    #     print(f"Theoretical Peak:      {theory_peak_mb} MB")
+    #     print(f"Patterns Found: {self.get_pattern_count()}")
+    #     print("--------------------" + "-" * len(self.__class__.__name__))
+
+
+def _cli() -> None:
+
+    p = argparse.ArgumentParser(description="FFIMiner")
+    p.add_argument("iFile", type=str, help="Path to input (.txt/.csv/.tsv or .parquet)")
+    p.add_argument("min_support", type=int, help="Minimum support threshold (scaled int)")
+    p.add_argument("-o", "--oFile", type=str, default="patterns.txt")
+    p.add_argument("--sep", type=str, default="\t", help="Separator for items in text inputs")
+    args = p.parse_args()
+
+    miner = FFIMiner(
+        iFile=args.iFile,
+        minSup=args.min_support,
+        sep=args.sep,
+    )
+    miner.mine()
+    # miner.print_results()
+    miner.printResults()
+    miner.save(args.oFile)
+
+    # parser = argparse.ArgumentParser(description="Fuzzy Frequent Itemset Miner (FFIMiner)")
+    # parser.add_argument("inputFile", type=str, help="Name of the Input file to mine complete set of correlated patterns")
+    # parser.add_argument("outputFile", type=str, help="Name of the output file to store complete set of correlated patterns")
+    # parser.add_argument("minSup", type=str, help="Minimum support threshold (can be count or proportion)")
+    # parser.add_argument("--sep", type=str, default="\t", help="Separator used to distinguish items in a transaction (default: tab)")
+
+    # args = parser.parse_args()
+
+    # ffiminer = FFIMiner(args.inputFile, args.minSup, args.sep)
+    # ffiminer.mine()
+    # print("Total number of Fuzzy-Frequent Patterns:", len(ffiminer.getPatterns()))
+    # ffiminer.save(args.outputFile)
+    # print("Total Memory in USS:", ffiminer.getMemoryUSS())
+    # print("Total Memory in RSS", ffiminer.getMemoryRSS())
+    # print("Total ExecutionTime in seconds:", ffiminer.getRuntime())
 
 if __name__ == "__main__":
-    _ap = str()
-    if len(_ab._sys.argv) == 4 or len(_ab._sys.argv) == 5:
-        if len(_ab._sys.argv) == 5:
-            _ap = FFIMiner(_ab._sys.argv[1], _ab._sys.argv[3], _ab._sys.argv[4])
-        if len(_ab._sys.argv) == 4:
-            _ap = FFIMiner(_ab._sys.argv[1], _ab._sys.argv[3])
-        _ap.mine()
-        _ap.mine()
-        print("Total number of Fuzzy-Frequent Patterns:", len(_ap.getPatterns()))
-        _ap.save(_ab._sys.argv[2])
-        print("Total Memory in USS:", _ap.getMemoryUSS())
-        print("Total Memory in RSS", _ap.getMemoryRSS())
-        print("Total ExecutionTime in seconds:", _ap.getRuntime())
-    else:
-        _ap = FFIMiner('/export/home1/ltarun/cuda_pami/data/fuzzy/Fuzzy_retail/Fuzzy_retail.csv', 25, '\t')
-        # _ap.mine()
-        _ap.mine()
-        print("Total number of Fuzzy-Frequent Patterns:", len(_ap.getPatterns()))
-        _ap.save('output.txt')
-        print(_ap.getPatternsAsDataFrame())
-        print("Total Memory in USS:", _ap.getMemoryUSS())
-        print("Total Memory in RSS", _ap.getMemoryRSS())
-        print("Total Execution Time in seconds:", _ap.getRuntime())
-        print("Error! The number of input parameters do not match the total number of parameters provided")
+    _cli()
+    #         _ap = FFIMiner(_ab._sys.argv[1], _ab._sys.argv[3], _ab._sys.argv[4])
+    #     if len(_ab._sys.argv) == 4:
+    #         _ap = FFIMiner(_ab._sys.argv[1], _ab._sys.argv[3])
+    #     _ap.mine()
+    #     _ap.mine()
+    #     print("Total number of Fuzzy-Frequent Patterns:", len(_ap.getPatterns()))
+    #     _ap.save(_ab._sys.argv[2])
+    #     print("Total Memory in USS:", _ap.getMemoryUSS())
+    #     print("Total Memory in RSS", _ap.getMemoryRSS())
+    #     print("Total ExecutionTime in seconds:", _ap.getRuntime())
+    # else:
+    #     _ap = FFIMiner('/export/home1/ltarun/cuda_pami/data/fuzzy/Fuzzy_retail/Fuzzy_retail_SF1_fixed_10.csv',1500, '\t')
+    #     # _ap.mine()
+    #     _ap.mine()
+    #     print("Total number of Fuzzy-Frequent Patterns:", len(_ap.getPatterns()))
+    #     _ap.save('output.txt')
+    #     print(_ap.getPatternsAsDataFrame())
+    #     print("Total Memory in USS:", _ap.getMemoryUSS())
+    #     print("Total Memory in RSS", _ap.getMemoryRSS())
+    #     print("Total Execution Time in seconds:", _ap.getRuntime())
+    #     print("Error! The number of input parameters do not match the total number of parameters provided")

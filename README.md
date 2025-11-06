@@ -148,3 +148,12 @@ make -C docs html
 ```
 
 The generated documentation will be available in the `docs/build/html` directory. You can view it by opening `docs/build/html/index.html` in your web browser.
+
+## Running Algorithms
+<!-- python3 -m src.algorithms.[algorithm_type].[algorithm_name] -->
+
+To run an algorithm directly from the command line, use the following syntax:
+
+```bash
+python3 -m src.algorithms.[algorithm_type].[algorithm_name]
+```

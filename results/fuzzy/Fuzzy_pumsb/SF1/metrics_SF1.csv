@@ -1,0 +1,17 @@
+dataset,sf,algorithm,support_quant_int,quant_mult,exec_time,cpu_mem_mb,gpu_mem_mb,patterns_found
+Fuzzy_pumsb,1,cuFFIMiner,100000,10,6.0474,1305.78,41072.56,283443.0
+Fuzzy_pumsb,1,naiveFFIMiner (floating),100000,10,1.3931,1305.78,41046.56,40214.0
+Fuzzy_pumsb,1,naiveFFIMiner (fixed),100000,10,5.3502,1305.78,41046.56,283443.0
+Fuzzy_pumsb,1,cuFFIMiner,110000,10,4.0334,1305.78,41072.56,159707.0
+Fuzzy_pumsb,1,naiveFFIMiner (floating),110000,10,1.2631,1305.78,41046.56,24829.0
+Fuzzy_pumsb,1,naiveFFIMiner (fixed),110000,10,3.3242,1305.78,41046.56,159707.0
+Fuzzy_pumsb,1,cuFFIMiner,120000,10,3.0326,1305.78,41072.56,94084.0
+Fuzzy_pumsb,1,naiveFFIMiner (floating),120000,10,1.1487,1305.78,41046.56,15721.0
+Fuzzy_pumsb,1,naiveFFIMiner (fixed),120000,10,2.4301,1305.78,41046.56,94084.0
+Fuzzy_pumsb,1,cuFFIMiner,130000,10,2.188,1305.78,41072.56,57209.0
+Fuzzy_pumsb,1,naiveFFIMiner (floating),130000,10,0.8185,1305.78,41046.56,10208.0
+Fuzzy_pumsb,1,naiveFFIMiner (fixed),130000,10,1.9094,1305.78,41046.56,57209.0
+Fuzzy_pumsb,1,cuFFIMiner,280000,10,1.3001,1305.78,41072.56,282.0
+Fuzzy_pumsb,1,naiveFFIMiner (floating),280000,10,0.6667,1305.78,41046.56,99.0
+Fuzzy_pumsb,1,naiveFFIMiner (fixed),280000,10,0.5938,1305.78,41046.56,282.0
+Fuzzy_pumsb,1,ffiMiner,280000,10,13.6784,1135.52,,282.0

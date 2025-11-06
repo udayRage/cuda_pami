@@ -844,8 +844,8 @@ def _cli() -> None:
         debug=args.debug,
     )
     miner.mine()
-    miner.save(args.oFile)
     miner.print_results()
+    miner.save(args.oFile)
 
 
 if __name__ == "__main__":  # pragma: no cover
