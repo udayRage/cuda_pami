@@ -1,17 +1,12 @@
 dataset,sf,algorithm,support_quant_int,quant_mult,exec_time,cpu_mem_mb,gpu_mem_mb,patterns_found
-Fuzzy_kosarak,10,cuFFIMiner,40000,10,13.2102,14088.52,41098.56,175185.0
-Fuzzy_kosarak,10,naiveFFIMiner (floating),40000,10,8.6202,14289.19,41074.56,44885.0
-Fuzzy_kosarak,10,naiveFFIMiner (fixed),40000,10,18.2972,14323.35,41074.56,175185.0
-Fuzzy_kosarak,10,cuFFIMiner,45000,10,10.6116,14088.52,41098.56,97848.0
-Fuzzy_kosarak,10,naiveFFIMiner (floating),45000,10,8.7254,14817.03,41074.56,28590.0
-Fuzzy_kosarak,10,naiveFFIMiner (fixed),45000,10,15.3646,14203.06,41074.56,97848.0
-Fuzzy_kosarak,10,cuFFIMiner,50000,10,8.5808,14088.52,41098.56,64760.0
-Fuzzy_kosarak,10,naiveFFIMiner (floating),50000,10,7.7058,14088.52,41074.56,20393.0
-Fuzzy_kosarak,10,naiveFFIMiner (fixed),50000,10,13.3272,14266.2,41074.56,64760.0
-Fuzzy_kosarak,10,cuFFIMiner,55000,10,7.404,14088.52,41098.56,47495.0
-Fuzzy_kosarak,10,naiveFFIMiner (floating),55000,10,7.623,14088.52,41074.56,15718.0
-Fuzzy_kosarak,10,naiveFFIMiner (fixed),55000,10,12.3267,15221.89,41074.56,47495.0
-Fuzzy_kosarak,10,cuFFIMiner,1000000,10,1.5531,14088.52,41098.56,191.0
-Fuzzy_kosarak,10,naiveFFIMiner (floating),1000000,10,4.2766,14088.52,41072.56,105.0
-Fuzzy_kosarak,10,naiveFFIMiner (fixed),1000000,10,4.2245,14088.52,41072.56,191.0
+Fuzzy_kosarak,10,cuFFIMiner,40000,10,13.2102,14088.52,,175185.0
+Fuzzy_kosarak,10,naiveFFIMiner (floating),40000,10,8.6202,14289.19,,44885.0
+Fuzzy_kosarak,10,cuFFIMiner,45000,10,10.6116,14088.52,,97848.0
+Fuzzy_kosarak,10,naiveFFIMiner (floating),45000,10,8.7254,14817.03,,28590.0
+Fuzzy_kosarak,10,cuFFIMiner,50000,10,8.5808,14088.52,,64760.0
+Fuzzy_kosarak,10,naiveFFIMiner (floating),50000,10,7.7058,14088.52,,20393.0
+Fuzzy_kosarak,10,cuFFIMiner,55000,10,7.404,14088.52,,47495.0
+Fuzzy_kosarak,10,naiveFFIMiner (floating),55000,10,7.623,14088.52,,15718.0
+Fuzzy_kosarak,10,cuFFIMiner,1000000,10,1.5531,14088.52,,191.0
+Fuzzy_kosarak,10,naiveFFIMiner (floating),1000000,10,4.2766,14088.52,,105.0
 Fuzzy_kosarak,10,ffiMiner,1000000,10,340.6111,18979.44,,191.0

@@ -1,17 +1,12 @@
 dataset,sf,algorithm,support_quant_int,quant_mult,exec_time,cpu_mem_mb,gpu_mem_mb,patterns_found
-Fuzzy_retail,10,cuFFIMiner,800,10,2.5784,2409.14,41092.56,136556.0
-Fuzzy_retail,10,naiveFFIMiner (floating),800,10,2.1689,2409.14,41064.56,41169.0
-Fuzzy_retail,10,naiveFFIMiner (fixed),800,10,2.8053,2458.25,41064.56,136556.0
-Fuzzy_retail,10,cuFFIMiner,900,10,2.5631,2409.14,41092.56,114415.0
-Fuzzy_retail,10,naiveFFIMiner (floating),900,10,2.177,2409.14,41064.56,35185.0
-Fuzzy_retail,10,naiveFFIMiner (fixed),900,10,2.6963,2409.14,41064.56,114415.0
-Fuzzy_retail,10,cuFFIMiner,1000,10,2.4556,2409.14,41092.56,98151.0
-Fuzzy_retail,10,naiveFFIMiner (floating),1000,10,2.1097,2432.1,41064.56,30615.0
-Fuzzy_retail,10,naiveFFIMiner (fixed),1000,10,2.6807,2442.9,41064.56,98151.0
-Fuzzy_retail,10,cuFFIMiner,1100,10,2.2112,2409.14,41092.56,85504.0
-Fuzzy_retail,10,naiveFFIMiner (floating),1100,10,1.954,2409.14,41064.56,27117.0
-Fuzzy_retail,10,naiveFFIMiner (fixed),1100,10,2.4239,2439.5,41064.56,85504.0
-Fuzzy_retail,10,cuFFIMiner,10000,10,1.2986,2409.14,41092.56,3530.0
-Fuzzy_retail,10,naiveFFIMiner (floating),10000,10,1.1328,2409.14,41064.56,1905.0
-Fuzzy_retail,10,naiveFFIMiner (fixed),10000,10,1.2135,2409.14,41064.56,3530.0
+Fuzzy_retail,10,cuFFIMiner,800,10,2.5784,2409.14,,136556.0
+Fuzzy_retail,10,naiveFFIMiner (floating),800,10,2.1689,2409.14,,41169.0
+Fuzzy_retail,10,cuFFIMiner,900,10,2.5631,2409.14,,114415.0
+Fuzzy_retail,10,naiveFFIMiner (floating),900,10,2.177,2409.14,,35185.0
+Fuzzy_retail,10,cuFFIMiner,1000,10,2.4556,2409.14,,98151.0
+Fuzzy_retail,10,naiveFFIMiner (floating),1000,10,2.1097,2432.1,,30615.0
+Fuzzy_retail,10,cuFFIMiner,1100,10,2.2112,2409.14,,85504.0
+Fuzzy_retail,10,naiveFFIMiner (floating),1100,10,1.954,2409.14,,27117.0
+Fuzzy_retail,10,cuFFIMiner,10000,10,1.2986,2409.14,,3530.0
+Fuzzy_retail,10,naiveFFIMiner (floating),10000,10,1.1328,2409.14,,1905.0
 Fuzzy_retail,10,ffiMiner,10000,10,189.3511,2380.18,,3530.0

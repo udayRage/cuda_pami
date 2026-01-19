@@ -1,17 +1,12 @@
 dataset,sf,algorithm,support_quant_int,quant_mult,exec_time,cpu_mem_mb,gpu_mem_mb,patterns_found
-Fuzzy_kosarak,1,cuFFIMiner,4000,10,2.1886,2409.14,41074.56,175186.0
-Fuzzy_kosarak,1,naiveFFIMiner (floating),4000,10,1.4312,2409.14,41046.56,44885.0
-Fuzzy_kosarak,1,naiveFFIMiner (fixed),4000,10,2.2929,2409.14,41046.56,175185.0
-Fuzzy_kosarak,1,cuFFIMiner,4500,10,2.14,2409.14,41074.56,97848.0
-Fuzzy_kosarak,1,naiveFFIMiner (floating),4500,10,1.2951,2409.14,41046.56,28590.0
-Fuzzy_kosarak,1,naiveFFIMiner (fixed),4500,10,1.7851,2409.14,41046.56,97848.0
-Fuzzy_kosarak,1,cuFFIMiner,5000,10,1.9511,2409.14,41074.56,64760.0
-Fuzzy_kosarak,1,naiveFFIMiner (floating),5000,10,1.3272,2409.14,41046.56,20393.0
-Fuzzy_kosarak,1,naiveFFIMiner (fixed),5000,10,1.6724,2409.14,41046.56,64760.0
-Fuzzy_kosarak,1,cuFFIMiner,5500,10,1.9249,2409.14,41074.56,47495.0
-Fuzzy_kosarak,1,naiveFFIMiner (floating),5500,10,1.2606,2409.14,41046.56,15718.0
-Fuzzy_kosarak,1,naiveFFIMiner (fixed),5500,10,1.7796,2409.14,41046.56,47495.0
-Fuzzy_kosarak,1,cuFFIMiner,100000,10,1.1837,2409.14,41074.56,191.0
-Fuzzy_kosarak,1,naiveFFIMiner (floating),100000,10,0.9304,2409.14,41046.56,105.0
-Fuzzy_kosarak,1,naiveFFIMiner (fixed),100000,10,0.8447,2409.14,41046.56,191.0
+Fuzzy_kosarak,1,cuFFIMiner,4000,10,2.1886,2409.14,,175186.0
+Fuzzy_kosarak,1,naiveFFIMiner (floating),4000,10,1.4312,2409.14,,44885.0
+Fuzzy_kosarak,1,cuFFIMiner,4500,10,2.14,2409.14,,97848.0
+Fuzzy_kosarak,1,naiveFFIMiner (floating),4500,10,1.2951,2409.14,,28590.0
+Fuzzy_kosarak,1,cuFFIMiner,5000,10,1.9511,2409.14,,64760.0
+Fuzzy_kosarak,1,naiveFFIMiner (floating),5000,10,1.3272,2409.14,,20393.0
+Fuzzy_kosarak,1,cuFFIMiner,5500,10,1.9249,2409.14,,47495.0
+Fuzzy_kosarak,1,naiveFFIMiner (floating),5500,10,1.2606,2409.14,,15718.0
+Fuzzy_kosarak,1,cuFFIMiner,100000,10,1.1837,2409.14,,191.0
+Fuzzy_kosarak,1,naiveFFIMiner (floating),100000,10,0.9304,2409.14,,105.0
 Fuzzy_kosarak,1,ffiMiner,100000,10,24.2274,2024.87,,191.0

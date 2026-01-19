@@ -31,3 +31,5 @@ scripts/io/out_all_shapes/*.csv
 scripts/io/out_all_shapes/*.parquet
 scripts/io/out_all_shapes/*.zip
 scripts/io/out_all_shapes/*.gz
+results/fuzzy/
+data/fuzzy/
